@@ -1,0 +1,7 @@
+torch
+torchaudio
+openai-whisper
+transformers
+mediapipe
+opencv-python
+yt-dlp
