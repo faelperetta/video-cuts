@@ -63,8 +63,8 @@ WHISPER_MODEL_SIZE = "small"
 SENTIMENT_MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
 # Highlight selection
-MIN_HIGHLIGHT_LEN = 8.0      # seconds
-MAX_HIGHLIGHT_LEN = 30.0     # seconds
+MIN_HIGHLIGHT_LEN = 15      # seconds
+MAX_HIGHLIGHT_LEN = 45.0     # seconds
 CONTEXT_BEFORE = 1.5         # seconds before a high-scoring segment
 CONTEXT_AFTER = 1.5          # seconds after a high-scoring segment
 NUM_HIGHLIGHTS = 3           # how many clips to export
@@ -92,6 +92,30 @@ SEGMENT_ABSORB_THRESHOLD = 0.3      # very short segments absorbed if neighbor i
 LIP_MOVEMENT_HISTORY_FRAMES = 5     # number of frames to track for lip movement delta
 LIP_MOVEMENT_MIN_DELTA = 0.003      # minimum change in mouth opening to count as "speaking"
 LIP_SPEAKING_THRESHOLD = 0.008      # cumulative lip movement to consider someone speaking
+
+# Animated Caption Style Configuration
+CAPTION_FONT_NAME = "Arial"         # Font family for captions
+CAPTION_FONT_SIZE = 58              # Font size in pixels
+CAPTION_PRIMARY_COLOR = "&H00FFFFFF"  # White (AABBGGRR format)
+CAPTION_HIGHLIGHT_COLOR = "&H0000FF00"  # Bright green for current word
+CAPTION_OUTLINE_COLOR = "&H00000000"  # Black outline
+CAPTION_BACK_COLOR = "&H80000000"     # Semi-transparent black background
+CAPTION_OUTLINE_WIDTH = 3           # Outline thickness
+CAPTION_SHADOW_DEPTH = 2            # Shadow depth
+CAPTION_MARGIN_V = 120              # Vertical margin from bottom
+CAPTION_WORDS_PER_LINE = 4          # Max words per caption line
+CAPTION_USE_WORD_HIGHLIGHT = True   # Enable word-by-word highlighting
+
+# Multi-Speaker Layout Configuration
+LAYOUT_MODE = "auto"                # "auto", "single", "split", "wide"
+LAYOUT_SPLIT_THRESHOLD = 0.35       # Min horizontal distance between faces to trigger split-screen
+LAYOUT_WIDE_THRESHOLD = 0.25        # Max distance to use wide shot instead of split
+LAYOUT_MIN_FACES_FOR_SPLIT = 2      # Minimum faces needed for split-screen
+LAYOUT_SPLIT_GAP = 20               # Pixels between split panels
+LAYOUT_BOTH_SPEAKING_WINDOW = 1.5   # Seconds window to detect both speakers active
+LAYOUT_BOTH_SPEAKING_RATIO = 0.3    # If both have >30% of max activity, consider both active
+LAYOUT_SEGMENT_MIN_DURATION = 2.0   # Minimum duration for a layout segment
+LAYOUT_WIDE_ZOOM = 0.85             # Zoom factor for wide shot (0.85 = show 85% width)
 
 FACE_DETECTOR_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detection/"
@@ -370,6 +394,228 @@ def write_clip_srt(
             f.write(f"{text}\n\n")
 
 
+def format_ass_timestamp(seconds: float) -> str:
+    """Convert seconds to ASS timestamp format (H:MM:SS.cc)."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int((seconds % 1) * 100)  # centiseconds
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def generate_ass_header(
+    play_res_x: int = 1080,
+    play_res_y: int = 1920
+) -> str:
+    """Generate ASS file header with styles for animated captions."""
+    return f"""[Script Info]
+Title: Animated Captions
+ScriptType: v4.00+
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{CAPTION_FONT_NAME},{CAPTION_FONT_SIZE},{CAPTION_PRIMARY_COLOR},{CAPTION_HIGHLIGHT_COLOR},{CAPTION_OUTLINE_COLOR},{CAPTION_BACK_COLOR},1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE_WIDTH},{CAPTION_SHADOW_DEPTH},2,40,40,{CAPTION_MARGIN_V},1
+Style: Highlight,{CAPTION_FONT_NAME},{CAPTION_FONT_SIZE},{CAPTION_HIGHLIGHT_COLOR},{CAPTION_PRIMARY_COLOR},{CAPTION_OUTLINE_COLOR},{CAPTION_BACK_COLOR},1,0,0,0,100,100,0,0,1,{CAPTION_OUTLINE_WIDTH},{CAPTION_SHADOW_DEPTH},2,40,40,{CAPTION_MARGIN_V},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def extract_words_for_clip(
+    segments: List[Dict],
+    clip_start: float,
+    clip_end: float
+) -> List[Dict]:
+    """
+    Extract word-level timing data for a clip from Whisper segments.
+    Returns list of words with start, end, and text.
+    """
+    words = []
+    
+    for seg in segments:
+        seg_start = seg.get("start", 0)
+        seg_end = seg.get("end", 0)
+        
+        # Skip segments outside clip range
+        if seg_end < clip_start or seg_start > clip_end:
+            continue
+        
+        # Check if segment has word-level timestamps
+        seg_words = seg.get("words", [])
+        
+        if seg_words:
+            for word_info in seg_words:
+                word_start = word_info.get("start", seg_start)
+                word_end = word_info.get("end", seg_end)
+                word_text = word_info.get("word", "").strip()
+                
+                # Skip words outside clip range
+                if word_end < clip_start or word_start > clip_end:
+                    continue
+                
+                if word_text:
+                    # Adjust to relative time
+                    rel_start = max(word_start - clip_start, 0)
+                    rel_end = min(word_end - clip_start, clip_end - clip_start)
+                    
+                    words.append({
+                        "start": rel_start,
+                        "end": rel_end,
+                        "text": word_text
+                    })
+        else:
+            # Fallback: split segment text into words with estimated timing
+            text = seg["text"].strip()
+            text_words = text.split()
+            if not text_words:
+                continue
+                
+            # Clamp segment to clip boundaries
+            clamped_start = max(seg_start, clip_start)
+            clamped_end = min(seg_end, clip_end)
+            duration = clamped_end - clamped_start
+            
+            if duration <= 0:
+                continue
+                
+            word_duration = duration / len(text_words)
+            
+            for i, word in enumerate(text_words):
+                word_start = clamped_start + i * word_duration
+                word_end = word_start + word_duration
+                
+                words.append({
+                    "start": word_start - clip_start,
+                    "end": word_end - clip_start,
+                    "text": word
+                })
+    
+    return words
+
+
+def group_words_into_lines(
+    words: List[Dict],
+    words_per_line: int = 4
+) -> List[Dict]:
+    """
+    Group words into caption lines for display.
+    Each line contains multiple words shown together.
+    """
+    if not words:
+        return []
+    
+    lines = []
+    current_line_words = []
+    
+    for word in words:
+        current_line_words.append(word)
+        
+        if len(current_line_words) >= words_per_line:
+            # Create a line entry
+            line_start = current_line_words[0]["start"]
+            line_end = current_line_words[-1]["end"]
+            
+            lines.append({
+                "start": line_start,
+                "end": line_end,
+                "words": current_line_words.copy()
+            })
+            current_line_words = []
+    
+    # Handle remaining words
+    if current_line_words:
+        line_start = current_line_words[0]["start"]
+        line_end = current_line_words[-1]["end"]
+        
+        lines.append({
+            "start": line_start,
+            "end": line_end,
+            "words": current_line_words
+        })
+    
+    return lines
+
+
+def write_clip_ass(
+    segments: List[Dict],
+    clip_start: float,
+    clip_end: float,
+    output_path: str
+) -> None:
+    """
+    Create an ASS subtitle file with word-by-word highlighting animation.
+    Each word gets highlighted in green as it's spoken.
+    """
+    # Extract words for this clip
+    words = extract_words_for_clip(segments, clip_start, clip_end)
+    
+    if not words:
+        # Fallback to empty subtitle
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(generate_ass_header())
+        return
+    
+    # Group words into display lines
+    lines = group_words_into_lines(words, CAPTION_WORDS_PER_LINE)
+    
+    # Generate ASS content
+    content = generate_ass_header()
+    
+    if CAPTION_USE_WORD_HIGHLIGHT:
+        # Generate events with word-by-word highlighting
+        for line in lines:
+            line_words = line["words"]
+            line_start = line["start"]
+            line_end = line["end"]
+            
+            # For each word timing within this line, create a dialogue event
+            # showing only words spoken so far, with current word highlighted
+            for word_idx, current_word in enumerate(line_words):
+                word_start = current_word["start"]
+                word_end = current_word["end"]
+                
+                # Build the text showing only words up to current (hide future words)
+                text_parts = []
+                for i, w in enumerate(line_words):
+                    if i > word_idx:
+                        # Future word - don't show it yet
+                        continue
+                    elif i == word_idx:
+                        # Highlight current word with color override and slight scale
+                        text_parts.append(
+                            f"{{\\c{CAPTION_HIGHLIGHT_COLOR}\\fscx105\\fscy105}}"
+                            f"{w['text'].upper()}"
+                            f"{{\\c{CAPTION_PRIMARY_COLOR}\\fscx100\\fscy100}}"
+                        )
+                    else:
+                        # Past word - show in normal color
+                        text_parts.append(w["text"].upper())
+                
+                line_text = " ".join(text_parts)
+                
+                # Add dialogue event
+                start_ts = format_ass_timestamp(word_start)
+                end_ts = format_ass_timestamp(word_end)
+                
+                content += f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{line_text}\n"
+    else:
+        # Simple mode: show whole line without per-word highlighting
+        for line in lines:
+            line_text = " ".join(w["text"].upper() for w in line["words"])
+            start_ts = format_ass_timestamp(line["start"])
+            end_ts = format_ass_timestamp(line["end"])
+            
+            content += f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{line_text}\n"
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 # ==========================
 # STEP 1: TRANSCRIBE WITH WHISPER (PYTORCH)
 # ==========================
@@ -381,13 +627,13 @@ def transcribe_to_srt_and_segments(
 ) -> List[Dict]:
     """
     Use Whisper (PyTorch) to transcribe `input_video`, write an SRT file,
-    and return the list of segments.
+    and return the list of segments with word-level timestamps.
     """
     print(f"[Whisper] Loading model '{model_size}'...")
     model = whisper.load_model(model_size)
 
-    print(f"[Whisper] Transcribing '{input_video}'...")
-    result = model.transcribe(input_video, task="transcribe")
+    print(f"[Whisper] Transcribing '{input_video}' with word timestamps...")
+    result = model.transcribe(input_video, task="transcribe", word_timestamps=True)
 
     segments = result["segments"]
 
@@ -1448,12 +1694,474 @@ def crop_x_expression_for_segments(
 
 
 # ==========================
+# STEP 5A-2: MULTI-SPEAKER LAYOUT DETECTION
+# ==========================
+
+def compute_multi_speaker_samples(
+    input_video: str,
+    clip_start: float,
+    clip_end: float,
+    analysis_fps: float = FACE_ANALYSIS_FPS
+) -> Tuple[List[Dict], Dict[int, List[Dict]]]:
+    """
+    Enhanced face tracking that returns:
+    1. samples: List of frame samples with all detected faces
+    2. tracks: Dict mapping track_id to list of detections over time
+    
+    Each sample contains:
+    - time: timestamp
+    - faces: list of detected faces with center, width, activity
+    - num_faces: count of faces detected
+    """
+    if cv2 is None:
+        return [], {}
+
+    detector_backend = "none"
+    face_landmarker = None
+    cascade = None
+
+    # Priority 1: FaceLandmarker
+    if MP_HAS_TASKS:
+        model_path = ensure_face_landmarker_model()
+        if model_path:
+            try:
+                base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
+                landmarker_options = mp_tasks_vision.FaceLandmarkerOptions(
+                    base_options=base_options,
+                    output_face_blendshapes=False,
+                    output_facial_transformation_matrixes=False,
+                    num_faces=4,
+                    min_face_detection_confidence=FACE_MIN_CONFIDENCE,
+                    min_face_presence_confidence=FACE_MIN_CONFIDENCE,
+                    min_tracking_confidence=0.5
+                )
+                face_landmarker = mp_tasks_vision.FaceLandmarker.create_from_options(landmarker_options)
+                detector_backend = "landmarker"
+            except Exception as exc:
+                print(f"[MultiSpeaker] FaceLandmarker unavailable ({exc}); falling back.")
+
+    # Priority 2: Haar cascade
+    if detector_backend == "none":
+        cascade = _load_haar_cascade()
+        if cascade is None:
+            print("[MultiSpeaker] No face detector available.")
+            return [], {}
+        detector_backend = "haar"
+
+    print(f"[MultiSpeaker] Using '{detector_backend}' for layout detection")
+
+    tracks: List[Dict] = []
+    next_track_id = 0
+    samples: List[Dict] = []
+    track_detections: Dict[int, List[Dict]] = {}
+    track_mouth_history: Dict[int, List[float]] = {}
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        frames_with_ts = _extract_frames_with_ffmpeg(
+            input_video,
+            clip_start,
+            clip_end,
+            analysis_fps,
+            temp_dir
+        )
+        
+        if not frames_with_ts:
+            return [], {}
+        
+        for ts, frame_path in frames_with_ts:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                continue
+
+            if detector_backend == "landmarker" and face_landmarker is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = _detect_faces_with_landmarker(face_landmarker, rgb)
+            else:
+                detections = _detect_faces_with_cascade(cascade, frame)
+
+            frame_faces = []
+            for det in detections:
+                # Match to existing track
+                best_track = None
+                best_dist = 1.0
+                for track in tracks:
+                    if ts - track["last_time"] > FACE_TRACK_MAX_GAP:
+                        continue
+                    dist = abs(det["center"] - track["center"])
+                    if dist < FACE_TRACK_DISTANCE and dist < best_dist:
+                        best_track = track
+                        best_dist = dist
+
+                if best_track is None:
+                    best_track = {
+                        "id": next_track_id,
+                        "center": det["center"],
+                        "last_time": ts
+                    }
+                    tracks.append(best_track)
+                    track_detections[next_track_id] = []
+                    next_track_id += 1
+
+                best_track["center"] = det["center"]
+                best_track["last_time"] = ts
+                tid = best_track["id"]
+                
+                # Compute lip movement
+                mouth_open = det.get("mouth_open", 0.0)
+                if tid not in track_mouth_history:
+                    track_mouth_history[tid] = []
+                
+                history = track_mouth_history[tid]
+                lip_movement = 0.0
+                if len(history) >= 1:
+                    lip_movement = abs(mouth_open - history[-1])
+                
+                history.append(mouth_open)
+                if len(history) > LIP_MOVEMENT_HISTORY_FRAMES:
+                    history.pop(0)
+                
+                face_info = {
+                    "track_id": tid,
+                    "center": det["center"],
+                    "width": det.get("width", 0.1),
+                    "activity": lip_movement,
+                    "time": ts
+                }
+                frame_faces.append(face_info)
+                track_detections[tid].append(face_info)
+            
+            samples.append({
+                "time": ts,
+                "faces": frame_faces,
+                "num_faces": len(frame_faces)
+            })
+
+    if face_landmarker is not None and hasattr(face_landmarker, "close"):
+        face_landmarker.close()
+
+    return samples, track_detections
+
+
+def determine_layout_segments(
+    samples: List[Dict],
+    track_detections: Dict[int, List[Dict]],
+    clip_start: float,
+    clip_end: float
+) -> List[Dict]:
+    """
+    Analyze multi-speaker samples to determine optimal layout for each time segment.
+    
+    Returns list of layout segments:
+    - start, end: time range
+    - layout: "single", "split", or "wide"
+    - faces: list of face info (for split/wide modes)
+    - active_track: track_id of active speaker (for single mode)
+    """
+    if not samples or LAYOUT_MODE == "single":
+        return [{"start": clip_start, "end": clip_end, "layout": "single", "active_track": None}]
+    
+    if LAYOUT_MODE in ("split", "wide"):
+        # Force specific layout
+        return [{"start": clip_start, "end": clip_end, "layout": LAYOUT_MODE, "faces": []}]
+    
+    # Auto mode: analyze face positions and activity
+    layout_samples = []
+    
+    # Compute cumulative activity per track
+    track_activity: Dict[int, float] = {}
+    for tid, detections in track_detections.items():
+        track_activity[tid] = sum(d.get("activity", 0) for d in detections)
+    
+    # Find the two most active tracks (likely the main speakers)
+    sorted_tracks = sorted(track_activity.items(), key=lambda x: x[1], reverse=True)
+    main_tracks = [t[0] for t in sorted_tracks[:2]] if len(sorted_tracks) >= 2 else []
+    
+    if len(main_tracks) < 2:
+        # Only one speaker detected - use single mode
+        print(f"[Layout] Only {len(main_tracks)} speaker(s) detected, using single mode")
+        return [{"start": clip_start, "end": clip_end, "layout": "single", "active_track": main_tracks[0] if main_tracks else None}]
+    
+    # Analyze each frame to determine layout
+    for sample in samples:
+        ts = sample["time"]
+        faces = sample["faces"]
+        
+        # Find faces belonging to main tracks
+        main_faces = [f for f in faces if f.get("track_id") in main_tracks]
+        
+        if len(main_faces) < 2:
+            # One or no main speakers visible - single mode following most active visible
+            visible_tracks = [f.get("track_id") for f in faces]
+            active = main_tracks[0] if main_tracks[0] in visible_tracks else (main_tracks[1] if len(main_tracks) > 1 and main_tracks[1] in visible_tracks else None)
+            layout_samples.append({
+                "time": ts,
+                "layout": "single",
+                "active_track": active,
+                "faces": faces
+            })
+        else:
+            # Both main speakers visible - check distance
+            face1 = next(f for f in main_faces if f.get("track_id") == main_tracks[0])
+            face2 = next(f for f in main_faces if f.get("track_id") == main_tracks[1])
+            
+            distance = abs(face1["center"] - face2["center"])
+            
+            # Check activity levels
+            act1 = face1.get("activity", 0)
+            act2 = face2.get("activity", 0)
+            max_act = max(act1, act2, 0.001)
+            both_active = (act1 / max_act > LAYOUT_BOTH_SPEAKING_RATIO and 
+                          act2 / max_act > LAYOUT_BOTH_SPEAKING_RATIO)
+            
+            if distance < LAYOUT_WIDE_THRESHOLD or both_active:
+                # Close together or both speaking - wide shot
+                layout_samples.append({
+                    "time": ts,
+                    "layout": "wide",
+                    "faces": main_faces,
+                    "center": (face1["center"] + face2["center"]) / 2
+                })
+            elif distance > LAYOUT_SPLIT_THRESHOLD:
+                # Far apart - split screen
+                layout_samples.append({
+                    "time": ts,
+                    "layout": "split",
+                    "faces": sorted(main_faces, key=lambda f: f["center"]),  # Left to right
+                    "left_center": min(face1["center"], face2["center"]),
+                    "right_center": max(face1["center"], face2["center"])
+                })
+            else:
+                # Medium distance - follow most active speaker
+                active_track = main_tracks[0] if act1 >= act2 else main_tracks[1]
+                layout_samples.append({
+                    "time": ts,
+                    "layout": "single",
+                    "active_track": active_track,
+                    "faces": faces
+                })
+    
+    # Consolidate into segments with minimum duration
+    if not layout_samples:
+        return [{"start": clip_start, "end": clip_end, "layout": "single", "active_track": None}]
+    
+    segments = []
+    current_layout = layout_samples[0]["layout"]
+    current_start = clip_start
+    current_data = layout_samples[0]
+    
+    for sample in layout_samples[1:]:
+        if sample["layout"] != current_layout:
+            # Layout change - check if current segment is long enough
+            segment_duration = sample["time"] - current_start
+            
+            if segment_duration >= LAYOUT_SEGMENT_MIN_DURATION:
+                # Save current segment
+                seg = {
+                    "start": current_start,
+                    "end": sample["time"],
+                    "layout": current_layout
+                }
+                if current_layout == "single":
+                    seg["active_track"] = current_data.get("active_track")
+                elif current_layout == "split":
+                    seg["left_center"] = current_data.get("left_center", 0.25)
+                    seg["right_center"] = current_data.get("right_center", 0.75)
+                elif current_layout == "wide":
+                    seg["center"] = current_data.get("center", 0.5)
+                segments.append(seg)
+                
+                current_start = sample["time"]
+                current_layout = sample["layout"]
+                current_data = sample
+            # Else: segment too short, keep current layout
+    
+    # Add final segment
+    seg = {
+        "start": current_start,
+        "end": clip_end,
+        "layout": current_layout
+    }
+    if current_layout == "single":
+        seg["active_track"] = current_data.get("active_track")
+    elif current_layout == "split":
+        seg["left_center"] = current_data.get("left_center", 0.25)
+        seg["right_center"] = current_data.get("right_center", 0.75)
+    elif current_layout == "wide":
+        seg["center"] = current_data.get("center", 0.5)
+    segments.append(seg)
+    
+    # Log layout segments
+    layout_counts = {"single": 0, "split": 0, "wide": 0}
+    for seg in segments:
+        layout_counts[seg["layout"]] = layout_counts.get(seg["layout"], 0) + 1
+    print(f"[Layout] Detected {len(segments)} layout segments: "
+          f"single={layout_counts['single']}, split={layout_counts['split']}, wide={layout_counts['wide']}")
+    
+    return segments
+
+
+def analyze_best_layout(
+    samples: List[Dict],
+    track_detections: Dict[int, List[Dict]],
+    clip_start: float,
+    clip_end: float
+) -> Dict:
+    """
+    Analyze multi-speaker samples and recommend the best layout for this clip.
+    
+    Returns a dict with:
+    - recommended_layout: "single", "split", or "wide"
+    - confidence: 0.0-1.0 score for the recommendation
+    - metrics: detailed analysis metrics
+    - reason: human-readable explanation
+    """
+    clip_duration = clip_end - clip_start
+    
+    if not samples or not track_detections:
+        return {
+            "recommended_layout": "single",
+            "confidence": 1.0,
+            "metrics": {},
+            "reason": "No face data available - defaulting to single speaker mode"
+        }
+    
+    # Compute metrics
+    num_tracks = len(track_detections)
+    
+    # Count frames with 0, 1, 2+ faces
+    frames_0_faces = sum(1 for s in samples if s["num_faces"] == 0)
+    frames_1_face = sum(1 for s in samples if s["num_faces"] == 1)
+    frames_2plus_faces = sum(1 for s in samples if s["num_faces"] >= 2)
+    total_frames = len(samples)
+    
+    pct_2plus = frames_2plus_faces / max(total_frames, 1)
+    pct_1_face = frames_1_face / max(total_frames, 1)
+    pct_0_faces = frames_0_faces / max(total_frames, 1)
+    
+    # Compute average face distance when 2+ faces visible
+    distances = []
+    both_active_count = 0
+    
+    for sample in samples:
+        faces = sample.get("faces", [])
+        if len(faces) >= 2:
+            # Get the two most prominent faces (by activity or position)
+            sorted_faces = sorted(faces, key=lambda f: f.get("activity", 0), reverse=True)[:2]
+            dist = abs(sorted_faces[0]["center"] - sorted_faces[1]["center"])
+            distances.append(dist)
+            
+            # Check if both are speaking
+            act1 = sorted_faces[0].get("activity", 0)
+            act2 = sorted_faces[1].get("activity", 0)
+            max_act = max(act1, act2, 0.001)
+            if act1 / max_act > 0.3 and act2 / max_act > 0.3:
+                both_active_count += 1
+    
+    avg_distance = sum(distances) / len(distances) if distances else 0
+    pct_both_active = both_active_count / max(len(distances), 1) if distances else 0
+    
+    # Compute activity per track
+    track_activities = {}
+    for tid, detections in track_detections.items():
+        total_activity = sum(d.get("activity", 0) for d in detections)
+        track_activities[tid] = total_activity
+    
+    # Sort tracks by activity
+    sorted_tracks = sorted(track_activities.items(), key=lambda x: x[1], reverse=True)
+    
+    # Activity ratio between top 2 speakers
+    if len(sorted_tracks) >= 2:
+        top_activity = sorted_tracks[0][1]
+        second_activity = sorted_tracks[1][1]
+        activity_ratio = second_activity / max(top_activity, 0.001)
+    else:
+        activity_ratio = 0
+    
+    # Build metrics dict
+    metrics = {
+        "num_tracks": num_tracks,
+        "total_frames": total_frames,
+        "pct_2plus_faces": round(pct_2plus * 100, 1),
+        "pct_1_face": round(pct_1_face * 100, 1),
+        "pct_0_faces": round(pct_0_faces * 100, 1),
+        "avg_face_distance": round(avg_distance, 3),
+        "pct_both_speaking": round(pct_both_active * 100, 1),
+        "activity_ratio": round(activity_ratio, 2),
+    }
+    
+    # Decision logic
+    # Priority 1: If rarely 2+ faces, use single mode
+    if pct_2plus < 0.3:
+        return {
+            "recommended_layout": "single",
+            "confidence": 0.9,
+            "metrics": metrics,
+            "reason": f"Single speaker dominant ({pct_1_face*100:.0f}% frames with 1 face)"
+        }
+    
+    # Priority 2: If 2+ faces often visible
+    if pct_2plus >= 0.3:
+        # Check distance to decide between split and wide
+        if avg_distance > LAYOUT_SPLIT_THRESHOLD:
+            # Faces are far apart - split screen is good
+            # But if both are active often, might prefer wide
+            if pct_both_active > 0.4:
+                return {
+                    "recommended_layout": "wide",
+                    "confidence": 0.75,
+                    "metrics": metrics,
+                    "reason": f"Both speakers active ({pct_both_active*100:.0f}% of time), distance={avg_distance:.2f}"
+                }
+            else:
+                return {
+                    "recommended_layout": "split",
+                    "confidence": 0.85,
+                    "metrics": metrics,
+                    "reason": f"Two speakers far apart (dist={avg_distance:.2f}), alternating speech"
+                }
+        
+        elif avg_distance < LAYOUT_WIDE_THRESHOLD:
+            # Faces are close together - wide shot
+            return {
+                "recommended_layout": "wide",
+                "confidence": 0.8,
+                "metrics": metrics,
+                "reason": f"Speakers close together (dist={avg_distance:.2f}), wide shot shows both"
+            }
+        
+        else:
+            # Medium distance - depends on activity pattern
+            if activity_ratio > 0.5 and pct_both_active > 0.3:
+                return {
+                    "recommended_layout": "wide",
+                    "confidence": 0.65,
+                    "metrics": metrics,
+                    "reason": f"Balanced conversation (activity ratio={activity_ratio:.1f})"
+                }
+            else:
+                return {
+                    "recommended_layout": "single",
+                    "confidence": 0.6,
+                    "metrics": metrics,
+                    "reason": f"One dominant speaker (activity ratio={activity_ratio:.1f})"
+                }
+    
+    # Default fallback
+    return {
+        "recommended_layout": "single",
+        "confidence": 0.5,
+        "metrics": metrics,
+        "reason": "Default fallback to single mode"
+    }
+
+
+# ==========================
 # STEP 5: CREATE VERTICAL CLIP WITH SUBS (FFMPEG)
 # ==========================
 
 def create_vertical_with_subs(
     input_video: str,
-    srt_path: str,
+    sub_path: str,
     output_video: str,
     start: float,
     duration: float,
@@ -1467,7 +2175,7 @@ def create_vertical_with_subs(
     - seek to `start`, cut `duration`
     - scale to fit target height
     - center crop
-    - burn subtitles
+    - burn subtitles (ASS or SRT)
     """
     cmd = ["ffmpeg", "-y"]
 
@@ -1481,13 +2189,23 @@ def create_vertical_with_subs(
         # Escape single quotes in the expression for ffmpeg filter syntax
         x_expr = crop_x_expr.replace("'", "\\'")
 
+    # Determine subtitle filter based on file extension
+    # ASS files use 'ass' filter, SRT files use 'subtitles' filter
+    sub_ext = os.path.splitext(sub_path)[1].lower()
+    if sub_ext == ".ass":
+        # Escape special characters in path for ffmpeg
+        escaped_path = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        sub_filter = f"ass='{escaped_path}'"
+    else:
+        sub_filter = f"subtitles='{sub_path}'"
+
     # Use filter_complex with proper quoting to handle expressions with decimals.
     # The crop expression must be escaped to prevent ffmpeg from misinterpreting
     # decimal points (e.g., "0.000") as filter chain separators.
     vf = (
         f"scale=-2:{target_h},"
         f"crop={target_w}:{target_h}:'{x_expr}':0,"
-        f"subtitles='{srt_path}'"
+        f"{sub_filter}"
     )
 
     cmd += [
@@ -1504,6 +2222,478 @@ def create_vertical_with_subs(
 
     run_ffmpeg_cmd(cmd)
     print(f"[Output] Wrote '{output_video}'.")
+
+
+def create_split_screen_clip(
+    input_video: str,
+    sub_path: str,
+    output_video: str,
+    start: float,
+    duration: float,
+    left_center: float,
+    right_center: float,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    fps: int = 30
+) -> None:
+    """
+    Create a vertical split-screen clip showing two speakers stacked vertically.
+    Each panel zooms in on the face of each speaker, like OpusClip.
+    The faces are centered and cropped to show head/shoulders.
+    """
+    panel_h = (target_h - LAYOUT_SPLIT_GAP) // 2
+    panel_w = target_w
+    
+    # For face-focused panels, we need to:
+    # 1. Scale video so we can extract a square-ish region around each face
+    # 2. Crop around each face's position to get a proper head/shoulders shot
+    # The aspect ratio of each panel is 1080x~950, which is wider than 1:1
+    # We want to zoom in more on the face, so use a smaller source crop
+    
+    cmd = ["ffmpeg", "-y"]
+    cmd += ["-ss", f"{start:.3f}", "-i", input_video]
+    cmd += ["-t", f"{duration:.3f}"]
+    
+    # Escape subtitle path
+    sub_ext = os.path.splitext(sub_path)[1].lower()
+    escaped_path = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    if sub_ext == ".ass":
+        sub_filter = f"ass='{escaped_path}'"
+    else:
+        sub_filter = f"subtitles='{sub_path}'"
+    
+    # For split screen with face focus:
+    # - Scale source to a height where we can get good face crops
+    # - Crop a region centered on each face
+    # - The crop should be zoomed in enough to show head/shoulders
+    # 
+    # Each panel is 1080 x panel_h (~950px)
+    # We want to crop from source in a way that:
+    # 1. Centers on the face horizontally (using left_center, right_center)
+    # 2. Crops from roughly upper-third of frame (where faces typically are)
+    
+    # Scale source to be wider than panel so we can pan to each face
+    # Then crop a panel-sized region centered on each speaker
+    scale_h = panel_h  # Scale to exact panel height
+    
+    # X position for each face (centered on their position)
+    left_x = f"clip(({left_center:.4f})*iw-{panel_w}/2,0,iw-{panel_w})"
+    right_x = f"clip(({right_center:.4f})*iw-{panel_w}/2,0,iw-{panel_w})"
+    
+    # Y position: crop from upper portion where faces are (about 10% from top)
+    face_y_offset = 0.1  # Start crop 10% from top of frame
+    
+    # Complex filter:
+    # 1. Create scaled version for top panel (left speaker)
+    # 2. Create scaled version for bottom panel (right speaker)
+    # 3. Crop each around their face position
+    # 4. Stack with gap
+    filter_complex = (
+        f"[0:v]scale=-2:{scale_h*2}[src];"
+        f"[src]crop={panel_w}:{panel_h}:'{left_x}':{int(scale_h*2*face_y_offset)}[top];"
+        f"[src]crop={panel_w}:{panel_h}:'{right_x}':{int(scale_h*2*face_y_offset)}[bottom];"
+        f"color=black:{target_w}x{LAYOUT_SPLIT_GAP}:d={duration}[gap];"
+        f"[top][gap][bottom]vstack=inputs=3[stacked];"
+        f"[stacked]{sub_filter}[out]"
+    )
+    
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", "0:a?",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_video
+    ]
+    
+    run_ffmpeg_cmd(cmd)
+    print(f"[Output] Wrote split-screen clip '{output_video}'.")
+
+
+def create_wide_shot_clip(
+    input_video: str,
+    sub_path: str,
+    output_video: str,
+    start: float,
+    duration: float,
+    center: float,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    fps: int = 30
+) -> None:
+    """
+    Create a vertical clip with wide shot showing both speakers.
+    Uses letterbox style: 16:9 video strip in middle with blurred background above/below.
+    This matches the OpusClip wide shot style.
+    """
+    # Calculate the video strip dimensions (16:9 aspect ratio in the middle)
+    video_strip_h = int(target_w * 9 / 16)  # 16:9 aspect ratio gives ~607px height for 1080 width
+    top_padding = (target_h - video_strip_h) // 2
+    bottom_padding = target_h - video_strip_h - top_padding
+    
+    cmd = ["ffmpeg", "-y"]
+    cmd += ["-ss", f"{start:.3f}", "-i", input_video]
+    cmd += ["-t", f"{duration:.3f}"]
+    
+    # Escape subtitle path
+    sub_ext = os.path.splitext(sub_path)[1].lower()
+    escaped_path = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    if sub_ext == ".ass":
+        sub_filter = f"ass='{escaped_path}'"
+    else:
+        sub_filter = f"subtitles='{sub_path}'"
+    
+    # Complex filter:
+    # 1. Create blurred background scaled to full height
+    # 2. Create sharp video strip scaled to 16:9 centered
+    # 3. Overlay the sharp strip on the blurred background
+    # 4. Add subtitles
+    # Calculate horizontal crop position for the wide shot
+    # We crop from the original video to show both speakers
+    filter_complex = (
+        f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},"
+        f"boxblur=20:5[bg];"
+        f"[0:v]scale={target_w}:-2:force_original_aspect_ratio=decrease[strip];"
+        f"[bg][strip]overlay=(W-w)/2:(H-h)/2[comp];"
+        f"[comp]{sub_filter}[out]"
+    )
+    
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", "0:a?",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_video
+    ]
+    
+    run_ffmpeg_cmd(cmd)
+    print(f"[Output] Wrote wide-shot clip '{output_video}'.")
+
+
+def create_multi_layout_clip(
+    input_video: str,
+    sub_path: str,
+    output_video: str,
+    start: float,
+    duration: float,
+    layout_segments: List[Dict],
+    speaker_segments: List[Dict],
+    clip_start: float,
+    clip_end: float,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    fps: int = 30
+) -> None:
+    """
+    Create a clip with DYNAMIC layout switching based on layout_segments.
+    Each segment is rendered with its own layout (single/split/wide),
+    then concatenated together, with subtitles applied at the end.
+    
+    This mimics professional tools like OpusClip that switch layouts
+    throughout a clip based on who is speaking.
+    """
+    if not layout_segments:
+        # Fallback to single mode
+        crop_expr = crop_x_expression_for_segments(speaker_segments, clip_start, clip_end, target_w)
+        create_vertical_with_subs(
+            input_video, sub_path, output_video, start, duration,
+            target_w, target_h, fps, crop_expr
+        )
+        return
+    
+    # If only one segment, render it directly with subs
+    if len(layout_segments) == 1:
+        seg = layout_segments[0]
+        seg_layout = seg["layout"]
+        
+        if seg_layout == "split":
+            create_split_screen_clip(
+                input_video, sub_path, output_video, start, duration,
+                seg.get("left_center", 0.25), seg.get("right_center", 0.75),
+                target_w, target_h, fps
+            )
+        elif seg_layout == "wide":
+            create_wide_shot_clip(
+                input_video, sub_path, output_video, start, duration,
+                seg.get("center", 0.5), target_w, target_h, fps
+            )
+        else:
+            crop_expr = crop_x_expression_for_segments(speaker_segments, clip_start, clip_end, target_w)
+            create_vertical_with_subs(
+                input_video, sub_path, output_video, start, duration,
+                target_w, target_h, fps, crop_expr
+            )
+        return
+    
+    # Multiple segments - use dynamic switching
+    print(f"[Layout] Creating dynamic layout clip with {len(layout_segments)} segments")
+    for i, seg in enumerate(layout_segments):
+        seg_dur = seg["end"] - seg["start"]
+        print(f"  Segment {i+1}: {seg['layout'].upper()} ({seg_dur:.2f}s)")
+    
+    # Create temp directory for segment clips
+    with tempfile.TemporaryDirectory() as temp_dir:
+        segment_files = []
+        
+        for i, seg in enumerate(layout_segments):
+            seg_start = seg["start"]
+            seg_end = seg["end"]
+            seg_layout = seg["layout"]
+            seg_duration = seg_end - seg_start
+            
+            temp_output = os.path.join(temp_dir, f"segment_{i:03d}.mp4")
+            
+            if seg_layout == "split":
+                _render_split_segment(
+                    input_video, temp_output, seg_start, seg_duration,
+                    seg.get("left_center", 0.25), seg.get("right_center", 0.75),
+                    target_w, target_h, fps
+                )
+            elif seg_layout == "wide":
+                _render_wide_segment(
+                    input_video, temp_output, seg_start, seg_duration,
+                    seg.get("center", 0.5), target_w, target_h, fps
+                )
+            else:  # single
+                # Get crop expression for this time range from speaker segments
+                crop_expr = _get_crop_for_time_range(
+                    speaker_segments, seg_start, seg_end, clip_start, target_w
+                )
+                _render_single_segment(
+                    input_video, temp_output, seg_start, seg_duration,
+                    crop_expr, target_w, target_h, fps
+                )
+            
+            segment_files.append(temp_output)
+        
+        # Create concat list file
+        concat_list = os.path.join(temp_dir, "concat_list.txt")
+        with open(concat_list, "w") as f:
+            for seg_file in segment_files:
+                f.write(f"file '{seg_file}'\n")
+        
+        # Concatenate segments (without subtitles yet)
+        temp_concat = os.path.join(temp_dir, "concat_nosubs.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            temp_concat
+        ]
+        print("[FFmpeg] Concatenating layout segments...")
+        subprocess.run(concat_cmd, check=True, capture_output=True)
+        
+        # Add subtitles to final output
+        sub_ext = os.path.splitext(sub_path)[1].lower()
+        escaped_path = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        if sub_ext == ".ass":
+            sub_filter = f"ass='{escaped_path}'"
+        else:
+            sub_filter = f"subtitles='{sub_path}'"
+        
+        final_cmd = [
+            "ffmpeg", "-y",
+            "-i", temp_concat,
+            "-vf", sub_filter,
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_video
+        ]
+        run_ffmpeg_cmd(final_cmd)
+        print(f"[Output] Wrote dynamic layout clip '{output_video}'.")
+
+
+def _render_single_segment(
+    input_video: str,
+    output_path: str,
+    start: float,
+    duration: float,
+    crop_x_expr: Optional[str],
+    target_w: int,
+    target_h: int,
+    fps: int
+) -> None:
+    """Render a single-speaker segment without subtitles."""
+    if crop_x_expr is None:
+        x_expr = f"(in_w-{target_w})/2"
+    else:
+        x_expr = crop_x_expr.replace("'", "\\'")
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", input_video,
+        "-t", f"{duration:.3f}",
+        "-vf", f"scale=-2:{target_h},crop={target_w}:{target_h}:'{x_expr}':0",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _render_split_segment(
+    input_video: str,
+    output_path: str,
+    start: float,
+    duration: float,
+    left_center: float,
+    right_center: float,
+    target_w: int,
+    target_h: int,
+    fps: int
+) -> None:
+    """Render a split-screen segment without subtitles (face-focused panels)."""
+    panel_h = (target_h - LAYOUT_SPLIT_GAP) // 2
+    panel_w = target_w
+    scale_h = panel_h
+    
+    # X position for each face (centered on their position)
+    left_x = f"clip(({left_center:.4f})*iw-{panel_w}/2,0,iw-{panel_w})"
+    right_x = f"clip(({right_center:.4f})*iw-{panel_w}/2,0,iw-{panel_w})"
+    
+    # Y position: crop from upper portion where faces are
+    face_y_offset = 0.1
+    
+    filter_complex = (
+        f"[0:v]scale=-2:{scale_h*2}[src];"
+        f"[src]crop={panel_w}:{panel_h}:'{left_x}':{int(scale_h*2*face_y_offset)}[top];"
+        f"[src]crop={panel_w}:{panel_h}:'{right_x}':{int(scale_h*2*face_y_offset)}[bottom];"
+        f"color=black:{target_w}x{LAYOUT_SPLIT_GAP}:d={duration}[gap];"
+        f"[top][gap][bottom]vstack=inputs=3[out]"
+    )
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", input_video,
+        "-t", f"{duration:.3f}",
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", "0:a?",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _render_wide_segment(
+    input_video: str,
+    output_path: str,
+    start: float,
+    duration: float,
+    center: float,
+    target_w: int,
+    target_h: int,
+    fps: int
+) -> None:
+    """Render a wide-shot segment without subtitles (letterbox style with blurred background)."""
+    # Create letterbox: blurred background with sharp 16:9 video strip in middle
+    filter_complex = (
+        f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h},"
+        f"boxblur=20:5[bg];"
+        f"[0:v]scale={target_w}:-2:force_original_aspect_ratio=decrease[strip];"
+        f"[bg][strip]overlay=(W-w)/2:(H-h)/2[out]"
+    )
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-i", input_video,
+        "-t", f"{duration:.3f}",
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", "0:a?",
+        "-r", str(fps),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _get_crop_for_time_range(
+    speaker_segments: List[Dict],
+    seg_start: float,
+    seg_end: float,
+    clip_start: float,
+    target_w: int
+) -> Optional[str]:
+    """
+    Extract the crop expression for a specific time range within the clip.
+    Filters speaker_segments to only include those overlapping with seg_start-seg_end.
+    """
+    if not speaker_segments:
+        return None
+    
+    # Filter segments that overlap with our time range
+    relevant_segments = []
+    for spk_seg in speaker_segments:
+        spk_start = spk_seg["start"]
+        spk_end = spk_seg["end"]
+        
+        # Check for overlap
+        if spk_end <= seg_start or spk_start >= seg_end:
+            continue
+        
+        # Clip to our range
+        clipped_start = max(spk_start, seg_start)
+        clipped_end = min(spk_end, seg_end)
+        
+        relevant_segments.append({
+            "start": clipped_start,
+            "end": clipped_end,
+            "center": spk_seg["center"]
+        })
+    
+    if not relevant_segments:
+        return None
+    
+    # Build crop expression for these segments
+    # Note: times need to be relative to seg_start (which becomes t=0 in the segment)
+    base_expr = f"(in_w-{target_w})/2"
+    expr = base_expr
+    
+    for seg in reversed(relevant_segments):
+        rel_start = max(seg["start"] - seg_start, 0.0)
+        rel_end = min(seg["end"] - seg_start, seg_end - seg_start)
+        
+        if rel_end <= rel_start:
+            continue
+        
+        center_expr = f"clip(({seg['center']:.4f})*in_w-{target_w}/2,0,in_w-{target_w})"
+        expr = f"if(between(t,{rel_start:.3f},{rel_end:.3f}),{center_expr},{expr})"
+    
+    return expr
 
 
 # ==========================
@@ -1590,37 +2780,105 @@ def main():
             output_name = f"highlight_{idx+1:02}.mp4"
 
         output_path = os.path.join(OUTPUT_DIR, output_name)
-        clip_srt_name = f"{os.path.splitext(output_name)[0]}_subs.srt"
-        clip_srt_path = os.path.join(OUTPUT_DIR, clip_srt_name)
+        
+        # Generate animated ASS subtitles with word-by-word highlighting
+        clip_ass_name = f"{os.path.splitext(output_name)[0]}_subs.ass"
+        clip_ass_path = os.path.join(OUTPUT_DIR, clip_ass_name)
+        write_clip_ass(segments, clip_start, clip_end, clip_ass_path)
 
-        write_clip_srt(segments, clip_start, clip_end, clip_srt_path)
-
-        crop_expr = None
+        speaker_segments = []
+        layout_segments = []
+        recommended_layout = None
+        
         if cv2 is not None and mp is not None:
+            # Compute multi-speaker layout analysis
+            print(f"\n[Clip {idx+1}] Analyzing multi-speaker layout...")
+            multi_samples, track_detections = compute_multi_speaker_samples(
+                INPUT_VIDEO,
+                clip_start,
+                clip_end
+            )
+            
+            # Get layout recommendation for this clip
+            layout_analysis = analyze_best_layout(
+                multi_samples,
+                track_detections,
+                clip_start,
+                clip_end
+            )
+            recommended_layout = layout_analysis["recommended_layout"]
+            
+            print(f"[Clip {idx+1}] Layout Analysis:")
+            print(f"  Recommended: {recommended_layout.upper()} (confidence: {layout_analysis['confidence']:.0%})")
+            print(f"  Reason: {layout_analysis['reason']}")
+            metrics = layout_analysis.get("metrics", {})
+            if metrics:
+                print(f"  Metrics: {metrics.get('num_tracks', 0)} tracks, "
+                      f"{metrics.get('pct_2plus_faces', 0):.0f}% multi-face, "
+                      f"avg dist={metrics.get('avg_face_distance', 0):.2f}, "
+                      f"both speaking={metrics.get('pct_both_speaking', 0):.0f}%")
+            
+            # Use recommended layout if in auto mode, otherwise use configured mode
+            effective_layout = recommended_layout if LAYOUT_MODE == "auto" else LAYOUT_MODE
+            
+            if effective_layout != "single":
+                layout_segments = determine_layout_segments(
+                    multi_samples,
+                    track_detections,
+                    clip_start,
+                    clip_end
+                )
+            
+            # Also compute single-speaker tracking for fallback
             samples = compute_speaker_samples(
                 INPUT_VIDEO,
                 clip_start,
                 clip_end
             )
             speaker_segments = build_speaker_segments(samples, clip_start, clip_end)
+        
+        # Determine effective layout mode for this clip
+        effective_layout = "single"
+        if LAYOUT_MODE == "auto" and recommended_layout:
+            effective_layout = recommended_layout
+        elif LAYOUT_MODE != "single":
+            effective_layout = LAYOUT_MODE
+        
+        # Create clip with appropriate layout
+        if effective_layout != "single" and layout_segments:
+            create_multi_layout_clip(
+                INPUT_VIDEO,
+                clip_ass_path,
+                output_path,
+                start=clip_start,
+                duration=duration,
+                layout_segments=layout_segments,
+                speaker_segments=speaker_segments,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                target_w=TARGET_WIDTH,
+                target_h=TARGET_HEIGHT,
+                fps=OUTPUT_FPS
+            )
+        else:
+            # Single speaker mode
             crop_expr = crop_x_expression_for_segments(
                 speaker_segments,
                 clip_start,
                 clip_end,
                 TARGET_WIDTH
             )
-
-        create_vertical_with_subs(
-            INPUT_VIDEO,
-            clip_srt_path,
-            output_path,
-            start=clip_start,
-            duration=duration,
-            target_w=TARGET_WIDTH,
-            target_h=TARGET_HEIGHT,
-            fps=OUTPUT_FPS,
-            crop_x_expr=crop_expr
-        )
+            create_vertical_with_subs(
+                INPUT_VIDEO,
+                clip_ass_path,
+                output_path,
+                start=clip_start,
+                duration=duration,
+                target_w=TARGET_WIDTH,
+                target_h=TARGET_HEIGHT,
+                fps=OUTPUT_FPS,
+                crop_x_expr=crop_expr
+            )
 
         generated_outputs.append(output_path)
 
