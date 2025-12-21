@@ -83,6 +83,11 @@ SPEAKER_SWITCH_THRESHOLD = 2.0      # other speaker must have 2x more cumulative
 SPEAKER_SMOOTHING_WINDOW = 0.5      # seconds of smoothing for crop position
 SPEAKER_POSITION_SMOOTHING = 0.5    # blend factor for position smoothing (0=instant, 1=no change)
 
+# Segment smoothing - eliminates jitter from micro-segments
+MIN_SEGMENT_DURATION = 0.5          # minimum segment duration in seconds (shorter segments get merged)
+SEGMENT_MERGE_THRESHOLD = 0.15      # merge segments with centers within this distance
+SEGMENT_ABSORB_THRESHOLD = 0.3      # very short segments absorbed if neighbor is within this distance
+
 # Lip movement detection - for identifying who is speaking
 LIP_MOVEMENT_HISTORY_FRAMES = 5     # number of frames to track for lip movement delta
 LIP_MOVEMENT_MIN_DELTA = 0.003      # minimum change in mouth opening to count as "speaking"
@@ -1332,19 +1337,85 @@ def build_speaker_segments(
             "center": center_val
         })
 
+    # === PHASE 1: Absorb very short segments into neighbors ===
+    # Segments shorter than MIN_SEGMENT_DURATION get absorbed by the longer neighbor
+    # if positions are similar enough
+    while True:
+        changed = False
+        new_segments: List[Dict] = []
+        i = 0
+        while i < len(segments):
+            seg = segments[i]
+            seg_duration = seg["end"] - seg["start"]
+            
+            if seg_duration < MIN_SEGMENT_DURATION and len(segments) > 1:
+                # This segment is too short - try to absorb it
+                prev_seg = new_segments[-1] if new_segments else None
+                next_seg = segments[i + 1] if i + 1 < len(segments) else None
+                
+                # Check which neighbor is closer in position
+                prev_dist = abs(seg["center"] - prev_seg["center"]) if prev_seg else float('inf')
+                next_dist = abs(seg["center"] - next_seg["center"]) if next_seg else float('inf')
+                
+                if prev_dist <= SEGMENT_ABSORB_THRESHOLD and prev_dist <= next_dist and prev_seg:
+                    # Absorb into previous segment
+                    prev_seg["end"] = seg["end"]
+                    changed = True
+                elif next_dist <= SEGMENT_ABSORB_THRESHOLD and next_seg:
+                    # Absorb into next segment (extend next segment's start backwards)
+                    next_seg["start"] = seg["start"]
+                    # Blend center slightly toward absorbed segment
+                    next_seg["center"] = (next_seg["center"] * 0.8 + seg["center"] * 0.2)
+                    changed = True
+                else:
+                    # Can't absorb - keep the segment
+                    new_segments.append(seg)
+            else:
+                new_segments.append(seg)
+            i += 1
+        
+        segments = new_segments
+        if not changed:
+            break
+    
+    # === PHASE 2: Merge adjacent segments with similar positions ===
     merged_segments: List[Dict] = []
     for seg in segments:
         if not merged_segments:
             merged_segments.append(seg)
             continue
         prev = merged_segments[-1]
-        if seg["start"] - prev["end"] < 0.05 and abs(seg["center"] - prev["center"]) < 0.02:
+        
+        # Merge if positions are similar
+        if abs(seg["center"] - prev["center"]) < SEGMENT_MERGE_THRESHOLD:
+            # Weighted average of centers based on duration
+            prev_dur = prev["end"] - prev["start"]
+            seg_dur = seg["end"] - seg["start"]
+            total_dur = prev_dur + seg_dur
+            if total_dur > 0:
+                prev["center"] = (prev["center"] * prev_dur + seg["center"] * seg_dur) / total_dur
             prev["end"] = seg["end"]
-            prev["center"] = (prev["center"] + seg["center"]) / 2.0
         else:
             merged_segments.append(seg)
 
-    return merged_segments
+    # === PHASE 3: Final cleanup - remove any remaining micro-segments ===
+    final_segments: List[Dict] = []
+    for seg in merged_segments:
+        seg_duration = seg["end"] - seg["start"]
+        if seg_duration < 0.1 and final_segments:
+            # Very tiny segment - just extend previous
+            final_segments[-1]["end"] = seg["end"]
+        else:
+            final_segments.append(seg)
+    
+    # Log segment summary
+    if final_segments:
+        print(f"[Segments] Built {len(final_segments)} segments from {len(samples)} samples")
+        for i, seg in enumerate(final_segments):
+            dur = seg["end"] - seg["start"]
+            print(f"  Seg {i+1}: {seg['start']-clip_start:.2f}s-{seg['end']-clip_start:.2f}s (dur={dur:.2f}s, center={seg['center']:.3f})")
+
+    return final_segments if final_segments else merged_segments
 
 
 def crop_x_expression_for_segments(
