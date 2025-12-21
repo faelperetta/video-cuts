@@ -1,13 +1,38 @@
+from __future__ import annotations
+
 import os
 import math
 import subprocess
-from typing import List, Dict, Tuple
+import urllib.request
+from typing import List, Dict, Tuple, Optional
+import statistics
+from contextlib import nullcontext
 
 import torch
-import torch.nn.functional as F
 import torchaudio
 import whisper
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+try:
+    import cv2  # type: ignore
+except ImportError:
+    cv2 = None
+
+try:
+    import mediapipe as mp  # type: ignore
+except ImportError:
+    mp = None
+
+MP_HAS_SOLUTIONS = bool(mp is not None and hasattr(mp, "solutions"))
+MP_HAS_TASKS = False
+
+if mp is not None:
+    try:
+        from mediapipe.tasks import python as mp_tasks_python  # type: ignore
+        from mediapipe.tasks.python import vision as mp_tasks_vision  # type: ignore
+        MP_HAS_TASKS = True
+    except Exception:
+        MP_HAS_TASKS = False
 
 
 # ==========================
@@ -43,6 +68,21 @@ CONTEXT_AFTER = 1.5          # seconds after a high-scoring segment
 NUM_HIGHLIGHTS = 3           # how many clips to export
 MIN_GAP_BETWEEN_HIGHLIGHTS = 4.0  # seconds of separation between clips
 LAST_WORD_PAD = 0.25         # small buffer to ensure last word finishes
+FACE_MIN_CONFIDENCE = 0.45   # mediapipe detection confidence
+FACE_ANALYSIS_FPS = 12.0     # sampling FPS for face tracking inside a clip
+FACE_TRACK_DISTANCE = 0.12   # max normalized horizontal delta to keep same track
+FACE_TRACK_MAX_GAP = 1.0     # seconds a track can go unseen before recycled
+SPEAKER_ACTIVITY_THRESHOLD = 0.0035  # threshold for choosing active speaker
+FACE_RECENTER_AFTER = 0.35    # seconds without detection before easing to center
+FACE_DETECTOR_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detection/"
+    "short_range/float16/1/face_detection_short_range.tflite"
+)
+FACE_DETECTOR_MODEL_PATH = os.path.join(
+    OUTPUT_DIR,
+    "models",
+    "face_detection_short_range.tflite"
+)
 
 # Reuse existing intermediates when possible
 FORCE_TRANSCRIBE = False
@@ -239,6 +279,30 @@ def write_clip_srt(
     output_path: str
 ) -> None:
     """Create a trimmed SRT where timestamps are relative to `clip_start`."""
+
+    def trim_text_to_clip(text: str, seg_start: float, seg_end: float) -> str:
+        """Heuristically drop unfinished sentences that extend beyond clip_end."""
+        if seg_end <= clip_end + 1e-3:
+            return text
+
+        total = max(seg_end - seg_start, 1e-3)
+        audible = max(min(clip_end, seg_end) - seg_start, 0.0)
+        coverage = max(min(audible / total, 1.0), 0.0)
+
+        if coverage <= 0.15:
+            return ""
+
+        approx_len = max(1, int(len(text) * coverage))
+        truncated = text[:approx_len].rstrip()
+
+        # Try to end on sentence boundary to avoid dangling words.
+        sentence_breaks = [truncated.rfind(marker) for marker in (".", "!", "?", ",")]
+        best_break = max(sentence_breaks)
+        if best_break >= max(len(truncated) * 0.35, 1):
+            truncated = truncated[:best_break + 1]
+
+        return truncated.strip()
+
     entries = []
     counter = 1
 
@@ -255,7 +319,14 @@ def write_clip_srt(
         if adj_end - adj_start < 1e-2:
             continue
 
-        entries.append((counter, adj_start, adj_end, seg["text"].strip()))
+        text = seg["text"].strip()
+        if seg_end > clip_end + 1e-3:
+            text = trim_text_to_clip(text, seg_start, seg_end)
+
+        if not text:
+            continue
+
+        entries.append((counter, adj_start, adj_end, text))
         counter += 1
 
     if not entries:
@@ -624,6 +695,334 @@ def select_highlight_intervals(
 
 
 # ==========================
+# STEP 5A: SPEAKER FRAMING ANALYSIS (OPENCV + MEDIAPIPE)
+# ==========================
+
+def ensure_face_detector_model() -> Optional[str]:
+    model_dir = os.path.dirname(FACE_DETECTOR_MODEL_PATH)
+    os.makedirs(model_dir, exist_ok=True)
+    if os.path.exists(FACE_DETECTOR_MODEL_PATH):
+        return FACE_DETECTOR_MODEL_PATH
+
+    try:
+        print("[FaceTracking] Downloading face detector weights...")
+        urllib.request.urlretrieve(
+            FACE_DETECTOR_MODEL_URL,
+            FACE_DETECTOR_MODEL_PATH
+        )
+        return FACE_DETECTOR_MODEL_PATH
+    except Exception as exc:
+        print(f"[FaceTracking] Failed to fetch detector model: {exc}")
+        return None
+
+
+def _mouth_open_metric(face_landmarks) -> float:
+    # FaceMesh landmark indices: 13 upper lip, 14 lower lip
+    upper = face_landmarks.landmark[13]
+    lower = face_landmarks.landmark[14]
+    return abs(lower.y - upper.y)
+
+
+def _detect_faces_with_mesh(mesh, rgb_frame):
+    results = mesh.process(rgb_frame)
+    detections = []
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            xs = [lm.x for lm in face_landmarks.landmark]
+            xmin = max(min(xs), 0.0)
+            xmax = min(max(xs), 1.0)
+            width = max(xmax - xmin, 1e-3)
+            center = (xmin + xmax) / 2.0
+            mouth_open = _mouth_open_metric(face_landmarks)
+            detections.append({
+                "center": max(0.0, min(1.0, center)),
+                "width": min(width, 1.0),
+                "activity": mouth_open
+            })
+    return detections
+
+
+def _detect_faces_with_tasks(detector, rgb_frame):
+    detections = []
+    if detector is None or mp is None:
+        return detections
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    result = detector.detect(mp_image)
+    h, w, _ = rgb_frame.shape
+
+    if not result.detections:
+        return detections
+
+    for det in result.detections:
+        bbox = det.bounding_box
+        center = (bbox.origin_x + bbox.width / 2.0) / max(w, 1)
+        width = bbox.width / max(w, 1)
+        score = det.categories[0].score if det.categories else 0.0
+        detections.append({
+            "center": max(0.0, min(1.0, center)),
+            "width": max(min(width, 1.0), 1e-3),
+            "activity": score
+        })
+
+    return detections
+
+
+def _detect_faces_with_cascade(cascade, frame_bgr):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    h, w = gray.shape
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    detections = []
+    for (x, y, fw, fh) in faces:
+        center = (x + fw / 2) / max(w, 1)
+        width = fw / max(w, 1)
+        activity = fh / max(h, 1)
+        detections.append({
+            "center": max(0.0, min(1.0, center)),
+            "width": max(min(width, 1.0), 1e-3),
+            "activity": activity
+        })
+    return detections
+
+
+def _load_haar_cascade():
+    cascade_path = getattr(cv2.data, "haarcascades", "")
+    cascade_file = os.path.join(cascade_path, "haarcascade_frontalface_default.xml")
+    cascade = cv2.CascadeClassifier(cascade_file)
+    if cascade.empty():
+        return None
+    return cascade
+
+
+def compute_speaker_samples(
+    input_video: str,
+    clip_start: float,
+    clip_end: float,
+    analysis_fps: float = FACE_ANALYSIS_FPS
+) -> List[Dict]:
+    if cv2 is None:
+        return []
+
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        return []
+
+    actual_duration = max(clip_end - clip_start, 1e-3)
+    total_frames = max(int(actual_duration * analysis_fps), 1)
+    sample_step = actual_duration / total_frames
+
+    detector_backend = "none"
+    tasks_detector = None
+    mesh = None
+    cascade = None
+
+    if MP_HAS_TASKS:
+        model_path = ensure_face_detector_model()
+        if model_path:
+            try:
+                base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
+                detector_options = mp_tasks_vision.FaceDetectorOptions(
+                    base_options=base_options,
+                    min_detection_confidence=FACE_MIN_CONFIDENCE
+                )
+                tasks_detector = mp_tasks_vision.FaceDetector.create_from_options(detector_options)
+                detector_backend = "tasks"
+            except Exception as exc:
+                print(f"[FaceTracking] Tasks detector unavailable ({exc}); falling back.")
+
+    if detector_backend == "none" and MP_HAS_SOLUTIONS and mp is not None:
+        mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=4,
+            refine_landmarks=True,
+            min_detection_confidence=FACE_MIN_CONFIDENCE,
+            min_tracking_confidence=0.5
+        )
+        detector_backend = "mesh"
+
+    if detector_backend == "none":
+        cascade = _load_haar_cascade()
+        if cascade is None:
+            print("[FaceTracking] Haar cascade not available; skipping speaker framing.")
+            cap.release()
+            return []
+        detector_backend = "haar"
+
+    tracks: List[Dict] = []
+    next_track_id = 0
+    samples: List[Dict] = []
+    last_center = 0.5
+    last_track_id: Optional[int] = None
+    last_detection_time = clip_start
+
+    with nullcontext():
+        for i in range(total_frames + 1):
+            rel_offset = min(i * sample_step, actual_duration)
+            ts = clip_start + rel_offset
+            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+            success, frame = cap.read()
+            if not success or frame is None:
+                continue
+
+            detections: List[Dict]
+            if detector_backend == "tasks":
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = _detect_faces_with_tasks(tasks_detector, rgb)
+            elif detector_backend == "mesh" and mesh is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = _detect_faces_with_mesh(mesh, rgb)
+            else:
+                detections = _detect_faces_with_cascade(cascade, frame)
+
+            assigned_entries = []
+            for det in detections:
+                best_track = None
+                best_dist = 1.0
+                for track in tracks:
+                    if ts - track["last_time"] > FACE_TRACK_MAX_GAP:
+                        continue
+                    dist = abs(det["center"] - track["center"])
+                    if dist < FACE_TRACK_DISTANCE and dist < best_dist:
+                        best_track = track
+                        best_dist = dist
+
+                if best_track is None:
+                    best_track = {
+                        "id": next_track_id,
+                        "center": det["center"],
+                        "last_time": ts
+                    }
+                    tracks.append(best_track)
+                    next_track_id += 1
+
+                best_track["center"] = det["center"]
+                best_track["last_time"] = ts
+                det["track_id"] = best_track["id"]
+                assigned_entries.append(det)
+
+            active_entry = None
+            if assigned_entries:
+                active_entry = max(assigned_entries, key=lambda d: d["activity"])
+                if (active_entry["activity"] < SPEAKER_ACTIVITY_THRESHOLD and
+                        len(assigned_entries) > 1):
+                    active_entry = None
+
+            if active_entry is None:
+                gap = ts - last_detection_time
+                if gap > FACE_RECENTER_AFTER:
+                    blend = min((gap - FACE_RECENTER_AFTER) / FACE_RECENTER_AFTER, 1.0)
+                    last_center = last_center * (1.0 - blend) + 0.5 * blend
+                samples.append({
+                    "time": ts,
+                    "center": last_center,
+                    "track_id": last_track_id
+                })
+            else:
+                last_center = active_entry["center"]
+                last_track_id = active_entry.get("track_id")
+                last_detection_time = ts
+                samples.append({
+                    "time": ts,
+                    "center": last_center,
+                    "track_id": last_track_id
+                })
+
+    cap.release()
+    if mesh is not None and hasattr(mesh, "close"):
+        mesh.close()
+    if tasks_detector is not None and hasattr(tasks_detector, "close"):
+        tasks_detector.close()
+    return samples
+
+
+def build_speaker_segments(
+    samples: List[Dict],
+    clip_start: float,
+    clip_end: float
+) -> List[Dict]:
+    if not samples:
+        return []
+
+    samples = sorted(samples, key=lambda s: s["time"])
+    current_start = clip_start
+    current_centers = [samples[0]["center"]]
+    current_track = samples[0].get("track_id")
+    segments: List[Dict] = []
+
+    for sample in samples[1:]:
+        ts = min(max(sample["time"], clip_start), clip_end)
+        if ts <= current_start:
+            current_centers.append(sample["center"])
+            continue
+
+        sample_track = sample.get("track_id")
+        if sample_track != current_track and current_centers:
+            center_val = statistics.median(current_centers) if current_centers else 0.5
+            segments.append({
+                "start": current_start,
+                "end": ts,
+                "center": center_val
+            })
+            current_start = ts
+            current_centers = [sample["center"]]
+            current_track = sample_track
+        else:
+            current_centers.append(sample["center"])
+
+    if current_start < clip_end:
+        center_val = statistics.median(current_centers) if current_centers else 0.5
+        segments.append({
+            "start": current_start,
+            "end": clip_end,
+            "center": center_val
+        })
+
+    merged_segments: List[Dict] = []
+    for seg in segments:
+        if not merged_segments:
+            merged_segments.append(seg)
+            continue
+        prev = merged_segments[-1]
+        if seg["start"] - prev["end"] < 0.05 and abs(seg["center"] - prev["center"]) < 0.02:
+            prev["end"] = seg["end"]
+            prev["center"] = (prev["center"] + seg["center"]) / 2.0
+        else:
+            merged_segments.append(seg)
+
+    return merged_segments
+
+
+def crop_x_expression_for_segments(
+    segments: List[Dict],
+    clip_start: float,
+    clip_end: float,
+    target_w: int
+) -> Optional[str]:
+    if not segments:
+        return None
+
+    duration = clip_end - clip_start
+    base_expr = f"(in_w-{target_w})/2"
+
+    expr = base_expr
+    for seg in reversed(segments):
+        rel_start = max(seg["start"] - clip_start, 0.0)
+        rel_end = min(seg["end"] - clip_start, duration)
+        if rel_end <= rel_start:
+            continue
+        center_expr = (
+            f"clip(({seg['center']:.4f})*in_w-{target_w}/2,0,in_w-{target_w})"
+        )
+        expr = (
+            f"if(between(t,{rel_start:.3f},{rel_end:.3f}),"
+            f"{center_expr},{expr})"
+        )
+
+    return expr
+
+
+# ==========================
 # STEP 5: CREATE VERTICAL CLIP WITH SUBS (FFMPEG)
 # ==========================
 
@@ -635,7 +1034,8 @@ def create_vertical_with_subs(
     duration: float,
     target_w: int = 1080,
     target_h: int = 1920,
-    fps: int = 30
+    fps: int = 30,
+    crop_x_expr: Optional[str] = None
 ) -> None:
     """
     Use ffmpeg to:
@@ -650,9 +1050,14 @@ def create_vertical_with_subs(
     cmd += ["-ss", f"{start:.3f}", "-i", input_video]
     cmd += ["-t", f"{duration:.3f}"]
 
+    if crop_x_expr is None:
+        x_expr = f"(in_w-{target_w})/2"
+    else:
+        x_expr = crop_x_expr
+
     vf = (
         f"scale=-2:{target_h},"
-        f"crop={target_w}:{target_h}:(in_w-{target_w})/2:0,"
+        f"crop={target_w}:{target_h}:{x_expr}:0,"
         f"subtitles='{srt_path}'"
     )
 
@@ -761,6 +1166,21 @@ def main():
 
         write_clip_srt(segments, clip_start, clip_end, clip_srt_path)
 
+        crop_expr = None
+        if cv2 is not None and mp is not None:
+            samples = compute_speaker_samples(
+                INPUT_VIDEO,
+                clip_start,
+                clip_end
+            )
+            speaker_segments = build_speaker_segments(samples, clip_start, clip_end)
+            crop_expr = crop_x_expression_for_segments(
+                speaker_segments,
+                clip_start,
+                clip_end,
+                TARGET_WIDTH
+            )
+
         create_vertical_with_subs(
             INPUT_VIDEO,
             clip_srt_path,
@@ -769,7 +1189,8 @@ def main():
             duration=duration,
             target_w=TARGET_WIDTH,
             target_h=TARGET_HEIGHT,
-            fps=OUTPUT_FPS
+            fps=OUTPUT_FPS,
+            crop_x_expr=crop_expr
         )
 
         generated_outputs.append(output_path)
