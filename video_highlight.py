@@ -794,7 +794,11 @@ def generate_hook_overlay_filter(
     - Centered horizontally, compact width
     """
     # Escape special characters for FFmpeg drawtext
-    escaped_text = hook_text.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+    # Order matters: escape backslashes first, then colons, then single quotes
+    escaped_text = hook_text.replace("\\", "\\\\\\\\")  # \ -> \\\\
+    escaped_text = escaped_text.replace(":", "\\:")     # : -> \:
+    escaped_text = escaped_text.replace("'", "\\'")     # ' -> \'
+    escaped_text = escaped_text.replace(",", "\\,")     # , -> \,  (prevent filter parsing issues)
     
     # Calculate timing
     fade_in_end = HOOK_FADE_IN_DURATION
@@ -802,10 +806,11 @@ def generate_hook_overlay_filter(
     fade_out_end = visible_end + HOOK_FADE_OUT_DURATION
     
     # Alpha expression: fade in -> hold -> fade out
+    # Note: No quotes around expression - FFmpeg filter parser handles it
     alpha_expr = (
-        f"if(lt(t,{fade_in_end}),t/{HOOK_FADE_IN_DURATION},"
-        f"if(lt(t,{visible_end}),1,"
-        f"if(lt(t,{fade_out_end}),(({fade_out_end}-t)/{HOOK_FADE_OUT_DURATION}),0)))"
+        f"if(lt(t\\,{fade_in_end})\\,t/{HOOK_FADE_IN_DURATION}\\,"
+        f"if(lt(t\\,{visible_end})\\,1\\,"
+        f"if(lt(t\\,{fade_out_end})\\,(({fade_out_end}-t)/{HOOK_FADE_OUT_DURATION})\\,0)))"
     )
     
     # Box color with opacity for the alpha animation
@@ -813,19 +818,20 @@ def generate_hook_overlay_filter(
     
     # Drawtext filter with white box background, centered
     # Using boxborderw for padding around text
+    # Note: No single quotes around alpha expression to avoid shell quoting issues
     drawtext_filter = (
-        f"drawtext=text='{escaped_text}':"
-        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"fontsize={HOOK_FONT_SIZE}:"
-        f"fontcolor={HOOK_PRIMARY_COLOR}:"
-        f"x=(w-text_w)/2:"
-        f"y={HOOK_POSITION_Y}:"
-        f"alpha='{alpha_expr}':"
-        f"box=1:"
-        f"boxcolor={box_color}:"
-        f"boxborderw={HOOK_BOX_PADDING}:"
-        f"shadowcolor={HOOK_SHADOW_COLOR}:"
-        f"shadowx=2:shadowy=2"
+        f"drawtext=text='{escaped_text}'\\:"
+        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\\:"
+        f"fontsize={HOOK_FONT_SIZE}\\:"
+        f"fontcolor={HOOK_PRIMARY_COLOR}\\:"
+        f"x=(w-text_w)/2\\:"
+        f"y={HOOK_POSITION_Y}\\:"
+        f"alpha={alpha_expr}\\:"
+        f"box=1\\:"
+        f"boxcolor={box_color}\\:"
+        f"boxborderw={HOOK_BOX_PADDING}\\:"
+        f"shadowcolor={HOOK_SHADOW_COLOR}\\:"
+        f"shadowx=2\\:shadowy=2"
     )
     
     return drawtext_filter
@@ -1478,6 +1484,312 @@ def _extract_frames_with_ffmpeg(
             frames_with_ts.append((ts, frame_path))
     
     return frames_with_ts
+
+
+# ==========================
+# UNIFIED FACE ANALYSIS (Optimized - single pass)
+# ==========================
+
+def analyze_clip_faces(
+    input_video: str,
+    clip_start: float,
+    clip_end: float,
+    analysis_fps: float = FACE_ANALYSIS_FPS
+) -> Dict:
+    """
+    Unified face analysis that extracts frames ONCE and returns all data needed for:
+    - Speaker tracking (single active speaker with smooth transitions)
+    - Multi-speaker layout detection (all faces per frame)
+    
+    Returns dict with:
+    - speaker_samples: List[Dict] - per-frame active speaker position (for crop expression)
+    - speaker_segments: List[Dict] - merged segments with center positions
+    - multi_samples: List[Dict] - all faces per frame (for layout analysis)
+    - track_detections: Dict[int, List[Dict]] - per-track face detections
+    - detector_backend: str - which detector was used
+    """
+    if cv2 is None:
+        return {
+            "speaker_samples": [],
+            "speaker_segments": [{"start": clip_start, "end": clip_end, "center": 0.5}],
+            "multi_samples": [],
+            "track_detections": {},
+            "detector_backend": "none"
+        }
+
+    # Initialize detector
+    detector_backend = "none"
+    face_landmarker = None
+    cascade = None
+
+    if MP_HAS_TASKS:
+        model_path = ensure_face_landmarker_model()
+        if model_path:
+            try:
+                base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
+                landmarker_options = mp_tasks_vision.FaceLandmarkerOptions(
+                    base_options=base_options,
+                    output_face_blendshapes=False,
+                    output_facial_transformation_matrixes=False,
+                    num_faces=4,
+                    min_face_detection_confidence=FACE_MIN_CONFIDENCE,
+                    min_face_presence_confidence=FACE_MIN_CONFIDENCE,
+                    min_tracking_confidence=0.5
+                )
+                face_landmarker = mp_tasks_vision.FaceLandmarker.create_from_options(landmarker_options)
+                detector_backend = "landmarker"
+            except Exception as exc:
+                print(f"[FaceAnalysis] FaceLandmarker unavailable ({exc}); falling back.")
+
+    if detector_backend == "none":
+        cascade = _load_haar_cascade()
+        if cascade is None:
+            print("[FaceAnalysis] No face detector available.")
+            return {
+                "speaker_samples": [],
+                "speaker_segments": [{"start": clip_start, "end": clip_end, "center": 0.5}],
+                "multi_samples": [],
+                "track_detections": {},
+                "detector_backend": "none"
+            }
+        detector_backend = "haar"
+
+    print(f"[FaceAnalysis] Using '{detector_backend}' for clip {clip_start:.2f}-{clip_end:.2f}s")
+
+    # Tracking state
+    tracks: List[Dict] = []
+    next_track_id = 0
+    track_detections: Dict[int, List[Dict]] = {}
+    track_mouth_history: Dict[int, List[float]] = {}
+    track_lip_activity: Dict[int, float] = {}
+    
+    # Multi-speaker data (all faces per frame)
+    multi_samples: List[Dict] = []
+    
+    # Speaker lock state for active speaker tracking
+    speaker_samples: List[Dict] = []
+    last_center: Optional[float] = None
+    last_track_id: Optional[int] = None
+    last_detection_time = clip_start
+    locked_track_id: Optional[int] = None
+    lock_start_time: float = clip_start
+    smoothed_center: Optional[float] = None
+    
+    # Debug counters
+    lip_speaking_detections = 0
+    total_multi_face_frames = 0
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        frames_with_ts = _extract_frames_with_ffmpeg(
+            input_video, clip_start, clip_end, analysis_fps, temp_dir
+        )
+        
+        if not frames_with_ts:
+            print(f"[FaceAnalysis] No frames extracted for clip {clip_start:.2f}-{clip_end:.2f}s")
+            return {
+                "speaker_samples": [],
+                "speaker_segments": [{"start": clip_start, "end": clip_end, "center": 0.5}],
+                "multi_samples": [],
+                "track_detections": {},
+                "detector_backend": detector_backend
+            }
+        
+        print(f"[FaceAnalysis] Extracted {len(frames_with_ts)} frames for analysis")
+        
+        for ts, frame_path in frames_with_ts:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                continue
+
+            # Detect faces
+            if detector_backend == "landmarker" and face_landmarker is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                detections = _detect_faces_with_landmarker(face_landmarker, rgb)
+            else:
+                detections = _detect_faces_with_cascade(cascade, frame)
+
+            # Process each detection
+            frame_faces = []
+            assigned_entries = []
+            
+            for det in detections:
+                # Match to existing track
+                best_track = None
+                best_dist = 1.0
+                for track in tracks:
+                    if ts - track["last_time"] > FACE_TRACK_MAX_GAP:
+                        continue
+                    dist = abs(det["center"] - track["center"])
+                    if dist < FACE_TRACK_DISTANCE and dist < best_dist:
+                        best_track = track
+                        best_dist = dist
+
+                if best_track is None:
+                    best_track = {
+                        "id": next_track_id,
+                        "center": det["center"],
+                        "last_time": ts
+                    }
+                    tracks.append(best_track)
+                    track_detections[next_track_id] = []
+                    next_track_id += 1
+
+                best_track["center"] = det["center"]
+                best_track["last_time"] = ts
+                tid = best_track["id"]
+                det["track_id"] = tid
+                
+                # Compute lip movement
+                mouth_open = det.get("mouth_open", 0.0)
+                if tid not in track_mouth_history:
+                    track_mouth_history[tid] = []
+                
+                history = track_mouth_history[tid]
+                lip_movement = 0.0
+                if len(history) >= 1:
+                    lip_movement = abs(mouth_open - history[-1])
+                    if lip_movement > LIP_MOVEMENT_MIN_DELTA:
+                        track_lip_activity[tid] = track_lip_activity.get(tid, 0.0) + lip_movement
+                
+                history.append(mouth_open)
+                if len(history) > LIP_MOVEMENT_HISTORY_FRAMES:
+                    history.pop(0)
+                
+                det["lip_movement"] = lip_movement
+                det["activity"] = lip_movement
+                
+                # For multi-speaker tracking
+                face_info = {
+                    "track_id": tid,
+                    "center": det["center"],
+                    "width": det.get("width", 0.1),
+                    "activity": lip_movement,
+                    "time": ts
+                }
+                frame_faces.append(face_info)
+                track_detections[tid].append(face_info)
+                assigned_entries.append(det)
+            
+            # Store multi-speaker sample (all faces this frame)
+            multi_samples.append({
+                "time": ts,
+                "faces": frame_faces,
+                "num_faces": len(frame_faces)
+            })
+
+            # === SPEAKER LOCK LOGIC (for single active speaker) ===
+            active_entry = None
+            
+            if assigned_entries:
+                if len(assigned_entries) == 1:
+                    active_entry = assigned_entries[0]
+                    if locked_track_id is None:
+                        locked_track_id = active_entry.get("track_id")
+                        lock_start_time = ts
+                else:
+                    total_multi_face_frames += 1
+                    
+                    locked_entry = None
+                    if locked_track_id is not None:
+                        for entry in assigned_entries:
+                            if entry.get("track_id") == locked_track_id:
+                                locked_entry = entry
+                                break
+                    
+                    time_with_current = ts - lock_start_time
+                    should_switch = False
+                    best_other_entry = None
+                    
+                    if locked_entry is None:
+                        should_switch = True
+                        best_other_score = -1.0
+                        for entry in assigned_entries:
+                            tid = entry.get("track_id")
+                            score = track_lip_activity.get(tid, 0.0)
+                            if score > best_other_score:
+                                best_other_score = score
+                                best_other_entry = entry
+                    elif time_with_current >= SPEAKER_LOCK_MIN_DURATION:
+                        current_lip_score = track_lip_activity.get(locked_track_id, 0.0)
+                        for entry in assigned_entries:
+                            tid = entry.get("track_id")
+                            if tid != locked_track_id:
+                                other_lip_score = track_lip_activity.get(tid, 0.0)
+                                if other_lip_score > current_lip_score * SPEAKER_SWITCH_THRESHOLD:
+                                    should_switch = True
+                                    lip_speaking_detections += 1
+                                    if best_other_entry is None or other_lip_score > track_lip_activity.get(best_other_entry.get("track_id"), 0.0):
+                                        best_other_entry = entry
+                    
+                    if should_switch and best_other_entry is not None:
+                        active_entry = best_other_entry
+                        locked_track_id = active_entry.get("track_id")
+                        lock_start_time = ts
+                        track_lip_activity = {locked_track_id: track_lip_activity.get(locked_track_id, 0.0)}
+                    else:
+                        active_entry = locked_entry if locked_entry else max(assigned_entries, key=lambda d: track_lip_activity.get(d.get("track_id"), 0.0))
+
+            # Build speaker sample
+            if active_entry is None:
+                if last_center is None:
+                    continue
+                gap = ts - last_detection_time
+                if gap > FACE_RECENTER_AFTER:
+                    blend = min((gap - FACE_RECENTER_AFTER) / FACE_RECENTER_AFTER, 1.0)
+                    last_center = last_center * (1.0 - blend) + 0.5 * blend
+                if smoothed_center is None:
+                    smoothed_center = last_center
+                else:
+                    smoothed_center = smoothed_center * SPEAKER_POSITION_SMOOTHING + last_center * (1.0 - SPEAKER_POSITION_SMOOTHING)
+                speaker_samples.append({
+                    "time": ts,
+                    "center": smoothed_center,
+                    "track_id": last_track_id
+                })
+            else:
+                last_center = active_entry["center"]
+                last_track_id = active_entry.get("track_id")
+                last_detection_time = ts
+                if smoothed_center is None:
+                    smoothed_center = last_center
+                else:
+                    smoothed_center = smoothed_center * SPEAKER_POSITION_SMOOTHING + last_center * (1.0 - SPEAKER_POSITION_SMOOTHING)
+                speaker_samples.append({
+                    "time": ts,
+                    "center": smoothed_center,
+                    "track_id": last_track_id
+                })
+
+    # Cleanup
+    if face_landmarker is not None and hasattr(face_landmarker, "close"):
+        face_landmarker.close()
+
+    # Handle no faces detected
+    if not speaker_samples:
+        print(f"[FaceAnalysis] No faces detected in clip; using center crop.")
+        speaker_samples = [
+            {"time": clip_start, "center": 0.5, "track_id": None},
+            {"time": clip_end, "center": 0.5, "track_id": None}
+        ]
+    else:
+        centers = [s["center"] for s in speaker_samples]
+        track_changes = sum(1 for i in range(1, len(speaker_samples)) 
+                          if speaker_samples[i].get("track_id") != speaker_samples[i-1].get("track_id"))
+        print(f"[FaceAnalysis] {len(speaker_samples)} samples, avg center={sum(centers)/len(centers):.3f}, "
+              f"speaker switches={track_changes}")
+        if detector_backend == "landmarker":
+            print(f"[FaceAnalysis] Multi-face frames: {total_multi_face_frames}, lip-based switches: {lip_speaking_detections}")
+
+    # Build speaker segments from samples
+    speaker_segments = build_speaker_segments(speaker_samples, clip_start, clip_end)
+
+    return {
+        "speaker_samples": speaker_samples,
+        "speaker_segments": speaker_segments,
+        "multi_samples": multi_samples,
+        "track_detections": track_detections,
+        "detector_backend": detector_backend
+    }
 
 
 def compute_speaker_samples(
@@ -2408,7 +2720,8 @@ def create_vertical_with_subs(
     target_w: int = 1080,
     target_h: int = 1920,
     fps: int = 30,
-    crop_x_expr: Optional[str] = None
+    crop_x_expr: Optional[str] = None,
+    hook_text: Optional[str] = None
 ) -> None:
     """
     Use ffmpeg to:
@@ -2416,6 +2729,7 @@ def create_vertical_with_subs(
     - scale to fit target height
     - center crop
     - burn subtitles (ASS or SRT)
+    - optionally add hook overlay in same pass
     """
     cmd = ["ffmpeg", "-y"]
 
@@ -2447,6 +2761,12 @@ def create_vertical_with_subs(
         f"crop={target_w}:{target_h}:'{x_expr}':0,"
         f"{sub_filter}"
     )
+    
+    # Add hook overlay filter if provided (inline, no second pass)
+    if hook_text:
+        hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+        vf += f",{hook_filter}"
+        print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
 
     cmd += [
         "-vf", vf,
@@ -2474,7 +2794,8 @@ def create_split_screen_clip(
     right_center: float,
     target_w: int = 1080,
     target_h: int = 1920,
-    fps: int = 30
+    fps: int = 30,
+    hook_text: Optional[str] = None
 ) -> None:
     """
     Create a vertical split-screen clip showing two speakers stacked vertically.
@@ -2501,6 +2822,12 @@ def create_split_screen_clip(
         sub_filter = f"ass='{escaped_path}'"
     else:
         sub_filter = f"subtitles='{sub_path}'"
+    
+    # Add hook overlay if provided
+    if hook_text:
+        hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+        sub_filter = f"{sub_filter},{hook_filter}"
+        print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
     
     # For split screen with face focus:
     # - Scale source to a height where we can get good face crops
@@ -2564,7 +2891,8 @@ def create_wide_shot_clip(
     center: float,
     target_w: int = 1080,
     target_h: int = 1920,
-    fps: int = 30
+    fps: int = 30,
+    hook_text: Optional[str] = None
 ) -> None:
     """
     Create a vertical clip with wide shot showing both speakers.
@@ -2587,6 +2915,12 @@ def create_wide_shot_clip(
         sub_filter = f"ass='{escaped_path}'"
     else:
         sub_filter = f"subtitles='{sub_path}'"
+    
+    # Add hook overlay if provided
+    if hook_text:
+        hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+        sub_filter = f"{sub_filter},{hook_filter}"
+        print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
     
     # Complex filter:
     # 1. Create blurred background scaled to full height
@@ -2634,7 +2968,8 @@ def create_multi_layout_clip(
     clip_end: float,
     target_w: int = 1080,
     target_h: int = 1920,
-    fps: int = 30
+    fps: int = 30,
+    hook_text: Optional[str] = None
 ) -> None:
     """
     Create a clip with DYNAMIC layout switching based on layout_segments.
@@ -2649,7 +2984,7 @@ def create_multi_layout_clip(
         crop_expr = crop_x_expression_for_segments(speaker_segments, clip_start, clip_end, target_w)
         create_vertical_with_subs(
             input_video, sub_path, output_video, start, duration,
-            target_w, target_h, fps, crop_expr
+            target_w, target_h, fps, crop_expr, hook_text
         )
         return
     
@@ -2662,18 +2997,18 @@ def create_multi_layout_clip(
             create_split_screen_clip(
                 input_video, sub_path, output_video, start, duration,
                 seg.get("left_center", 0.25), seg.get("right_center", 0.75),
-                target_w, target_h, fps
+                target_w, target_h, fps, hook_text
             )
         elif seg_layout == "wide":
             create_wide_shot_clip(
                 input_video, sub_path, output_video, start, duration,
-                seg.get("center", 0.5), target_w, target_h, fps
+                seg.get("center", 0.5), target_w, target_h, fps, hook_text
             )
         else:
             crop_expr = crop_x_expression_for_segments(speaker_segments, clip_start, clip_end, target_w)
             create_vertical_with_subs(
                 input_video, sub_path, output_video, start, duration,
-                target_w, target_h, fps, crop_expr
+                target_w, target_h, fps, crop_expr, hook_text
             )
         return
     
@@ -2736,7 +3071,7 @@ def create_multi_layout_clip(
         print("[FFmpeg] Concatenating layout segments...")
         subprocess.run(concat_cmd, check=True, capture_output=True)
         
-        # Add subtitles to final output
+        # Add subtitles (and hook overlay if provided) to final output
         sub_ext = os.path.splitext(sub_path)[1].lower()
         escaped_path = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
         if sub_ext == ".ass":
@@ -2744,10 +3079,17 @@ def create_multi_layout_clip(
         else:
             sub_filter = f"subtitles='{sub_path}'"
         
+        # Combine subtitle and hook filters in single pass
+        vf = sub_filter
+        if hook_text:
+            hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+            vf += f",{hook_filter}"
+            print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
+        
         final_cmd = [
             "ffmpeg", "-y",
             "-i", temp_concat,
-            "-vf", sub_filter,
+            "-vf", vf,
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "18",
@@ -3103,13 +3445,18 @@ def main():
         recommended_layout = None
         
         if cv2 is not None and mp is not None:
-            # Compute multi-speaker layout analysis
-            print(f"\n[Clip {idx+1}] Analyzing multi-speaker layout...")
-            multi_samples, track_detections = compute_multi_speaker_samples(
+            # UNIFIED face analysis - single frame extraction pass
+            print(f"\n[Clip {idx+1}] Running unified face analysis...")
+            face_analysis = analyze_clip_faces(
                 INPUT_VIDEO,
                 clip_start,
                 clip_end
             )
+            
+            # Extract results
+            speaker_segments = face_analysis["speaker_segments"]
+            multi_samples = face_analysis["multi_samples"]
+            track_detections = face_analysis["track_detections"]
             
             # Get layout recommendation for this clip
             layout_analysis = analyze_best_layout(
@@ -3140,14 +3487,6 @@ def main():
                     clip_start,
                     clip_end
                 )
-            
-            # Also compute single-speaker tracking for fallback
-            samples = compute_speaker_samples(
-                INPUT_VIDEO,
-                clip_start,
-                clip_end
-            )
-            speaker_segments = build_speaker_segments(samples, clip_start, clip_end)
         
         # Determine effective layout mode for this clip
         effective_layout = "single"
@@ -3156,7 +3495,23 @@ def main():
         elif LAYOUT_MODE != "single":
             effective_layout = LAYOUT_MODE
         
-        # Create clip with appropriate layout
+        # Detect hook phrase BEFORE creating clip (so we can inline it)
+        clip_hook_text = None
+        if HOOK_ENABLED:
+            hook_info = detect_hook_phrase(
+                segments,
+                clip_start,
+                clip_end,
+                hook_keywords
+            )
+            if hook_info:
+                clip_hook_text = hook_info["text"]
+                display_text = f'"{clip_hook_text[:50]}..."' if len(clip_hook_text) > 50 else f'"{clip_hook_text}"'
+                print(f"[Hook] Detected hook for clip {idx+1}: {display_text}")
+            else:
+                print(f"[Hook] No suitable hook phrase found for clip {idx+1}")
+        
+        # Create clip with appropriate layout (hook inlined in single pass)
         if effective_layout != "single" and layout_segments:
             create_multi_layout_clip(
                 INPUT_VIDEO,
@@ -3170,7 +3525,8 @@ def main():
                 clip_end=clip_end,
                 target_w=TARGET_WIDTH,
                 target_h=TARGET_HEIGHT,
-                fps=OUTPUT_FPS
+                fps=OUTPUT_FPS,
+                hook_text=clip_hook_text
             )
         else:
             # Single speaker mode
@@ -3189,40 +3545,9 @@ def main():
                 target_w=TARGET_WIDTH,
                 target_h=TARGET_HEIGHT,
                 fps=OUTPUT_FPS,
-                crop_x_expr=crop_expr
+                crop_x_expr=crop_expr,
+                hook_text=clip_hook_text
             )
-
-        # Apply auto-hook overlay if enabled
-        if HOOK_ENABLED:
-            hook_info = detect_hook_phrase(
-                segments,
-                clip_start,
-                clip_end,
-                hook_keywords
-            )
-            
-            if hook_info:
-                # Apply hook overlay to the generated clip
-                hook_output_path = output_path.replace(".mp4", "_hooked.mp4")
-                try:
-                    apply_hook_overlay(
-                        output_path,
-                        hook_output_path,
-                        hook_info["text"],
-                        TARGET_WIDTH,
-                        TARGET_HEIGHT
-                    )
-                    # Replace original with hooked version
-                    os.replace(hook_output_path, output_path)
-                    print(f"[Hook] Applied hook to clip {idx+1}: \"{hook_info['text'][:50]}...\"" 
-                          if len(hook_info['text']) > 50 else f"[Hook] Applied hook to clip {idx+1}: \"{hook_info['text']}\"")
-                except subprocess.CalledProcessError as e:
-                    print(f"[Hook] Warning: Failed to apply hook overlay: {e}")
-                    # Clean up temp file if it exists
-                    if os.path.exists(hook_output_path):
-                        os.remove(hook_output_path)
-            else:
-                print(f"[Hook] No suitable hook phrase found for clip {idx+1}")
 
         generated_outputs.append(output_path)
 
