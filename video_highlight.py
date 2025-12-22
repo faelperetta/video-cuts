@@ -49,6 +49,8 @@ class VideoConfig:
     target_width: int = 1080
     target_height: int = 1920
     output_fps: int = 30
+    ffmpeg_preset: str = "medium"    # ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow
+    ffmpeg_crf: int = 18             # Quality (lower = better, 18-23 recommended)
 
 
 @dataclass
@@ -200,6 +202,20 @@ class Config:
     content_type: str = "coding"      # "coding", "fitness", "gaming"
     force_transcribe: bool = False
     force_audio_extraction: bool = False
+    fast_mode: bool = False           # --fast flag for faster dev iterations
+    
+    def enable_fast_mode(self) -> None:
+        """Enable fast mode for quicker development iterations.
+        
+        Fast mode:
+        - Uses ultrafast FFmpeg preset (5-10x faster encoding)
+        - Reduces face analysis FPS from 12 to 6 (2x faster analysis)
+        - Slightly lower video quality (acceptable for preview)
+        """
+        self.fast_mode = True
+        self.video.ffmpeg_preset = "ultrafast"
+        self.video.ffmpeg_crf = 23  # Slightly lower quality
+        self.face_tracking.analysis_fps = 6.0  # Half the analysis frames
 
 
 # Global config instance - can be replaced via CLI or programmatically
@@ -1945,296 +1961,6 @@ def analyze_clip_faces(
     }
 
 
-def compute_speaker_samples(
-    input_video: str,
-    clip_start: float,
-    clip_end: float,
-    analysis_fps: float = FACE_ANALYSIS_FPS
-) -> List[Dict]:
-    if cv2 is None:
-        return []
-
-    actual_duration = max(clip_end - clip_start, 1e-3)
-
-    detector_backend = "none"
-    face_landmarker = None
-    cascade = None
-
-    # Priority 1: FaceLandmarker (provides lip landmarks for speaking detection)
-    if MP_HAS_TASKS:
-        model_path = ensure_face_landmarker_model()
-        if model_path:
-            try:
-                base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
-                landmarker_options = mp_tasks_vision.FaceLandmarkerOptions(
-                    base_options=base_options,
-                    output_face_blendshapes=False,
-                    output_facial_transformation_matrixes=False,
-                    num_faces=4,
-                    min_face_detection_confidence=FACE_MIN_CONFIDENCE,
-                    min_face_presence_confidence=FACE_MIN_CONFIDENCE,
-                    min_tracking_confidence=0.5
-                )
-                face_landmarker = mp_tasks_vision.FaceLandmarker.create_from_options(landmarker_options)
-                detector_backend = "landmarker"
-            except Exception as exc:
-                print(f"[FaceTracking] FaceLandmarker unavailable ({exc}); falling back.")
-
-    # Priority 2: Haar cascade (no lip detection, uses position only)
-    if detector_backend == "none":
-        cascade = _load_haar_cascade()
-        if cascade is None:
-            print("[FaceTracking] Haar cascade not available; skipping speaker framing.")
-            return []
-        detector_backend = "haar"
-        print("[FaceTracking] Warning: Using Haar cascade - lip detection disabled, speaker tracking by position only")
-
-    print(f"[FaceTracking] Using '{detector_backend}' backend for clip {clip_start:.2f}-{clip_end:.2f}s")
-
-    tracks: List[Dict] = []
-    next_track_id = 0
-    samples: List[Dict] = []
-    # Defer initialization of last_center - will be set from first detection
-    last_center: Optional[float] = None
-    last_track_id: Optional[int] = None
-    last_detection_time = clip_start
-    
-    # Speaker lock state - prevents jittery switching
-    locked_track_id: Optional[int] = None
-    lock_start_time: float = clip_start
-    track_lip_activity: Dict[int, float] = {}  # cumulative LIP MOVEMENT (delta) per track
-    track_mouth_history: Dict[int, List[float]] = {}  # recent mouth opening values per track
-    smoothed_center: Optional[float] = None
-    
-    # Debug counters for lip detection
-    lip_speaking_detections = 0
-    total_multi_face_frames = 0
-
-    # Use a temporary directory for frame extraction
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Extract frames using ffmpeg (handles AV1 properly)
-        frames_with_ts = _extract_frames_with_ffmpeg(
-            input_video,
-            clip_start,
-            clip_end,
-            analysis_fps,
-            temp_dir
-        )
-        
-        if not frames_with_ts:
-            print(f"[FaceTracking] No frames extracted for clip {clip_start:.2f}-{clip_end:.2f}s")
-            return []
-        
-        print(f"[FaceTracking] Extracted {len(frames_with_ts)} frames for analysis")
-        
-        for ts, frame_path in frames_with_ts:
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                continue
-
-            detections: List[Dict]
-            if detector_backend == "landmarker" and face_landmarker is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                detections = _detect_faces_with_landmarker(face_landmarker, rgb)
-            else:
-                detections = _detect_faces_with_cascade(cascade, frame)
-
-            assigned_entries = []
-            for det in detections:
-                best_track = None
-                best_dist = 1.0
-                for track in tracks:
-                    if ts - track["last_time"] > FACE_TRACK_MAX_GAP:
-                        continue
-                    dist = abs(det["center"] - track["center"])
-                    if dist < FACE_TRACK_DISTANCE and dist < best_dist:
-                        best_track = track
-                        best_dist = dist
-
-                if best_track is None:
-                    best_track = {
-                        "id": next_track_id,
-                        "center": det["center"],
-                        "last_time": ts
-                    }
-                    tracks.append(best_track)
-                    next_track_id += 1
-
-                best_track["center"] = det["center"]
-                best_track["last_time"] = ts
-                det["track_id"] = best_track["id"]
-                
-                # === LIP MOVEMENT DETECTION ===
-                # Track mouth opening over time and compute DELTA (change) 
-                # This detects actual speaking vs just having mouth open or moving around
-                tid = best_track["id"]
-                mouth_open = det.get("mouth_open", 0.0)
-                
-                # Initialize mouth history for this track if needed
-                if tid not in track_mouth_history:
-                    track_mouth_history[tid] = []
-                
-                history = track_mouth_history[tid]
-                
-                # Compute lip movement as the variance/change in mouth opening
-                lip_movement = 0.0
-                if len(history) >= 1:
-                    # Calculate the absolute delta from previous frame
-                    prev_mouth = history[-1]
-                    lip_movement = abs(mouth_open - prev_mouth)
-                    
-                    # Only count as "speaking activity" if movement exceeds threshold
-                    if lip_movement > LIP_MOVEMENT_MIN_DELTA:
-                        track_lip_activity[tid] = track_lip_activity.get(tid, 0.0) + lip_movement
-                
-                # Update history (keep last N frames)
-                history.append(mouth_open)
-                if len(history) > LIP_MOVEMENT_HISTORY_FRAMES:
-                    history.pop(0)
-                
-                # Store the lip movement score for speaker selection
-                det["lip_movement"] = lip_movement
-                det["activity"] = lip_movement  # Use lip movement as activity metric
-                
-                assigned_entries.append(det)
-
-            # === SPEAKER LOCK LOGIC ===
-            # Determine which speaker to follow based on LIP MOVEMENT (who is talking)
-            # Uses hysteresis to prevent jitter
-            active_entry = None
-            
-            if assigned_entries:
-                if len(assigned_entries) == 1:
-                    # Only one face - always use it
-                    active_entry = assigned_entries[0]
-                    if locked_track_id is None:
-                        locked_track_id = active_entry.get("track_id")
-                        lock_start_time = ts
-                else:
-                    # Multiple faces - detect who is SPEAKING based on lip movement
-                    total_multi_face_frames += 1
-                    
-                    # Find the entry for the currently locked speaker
-                    locked_entry = None
-                    if locked_track_id is not None:
-                        for entry in assigned_entries:
-                            if entry.get("track_id") == locked_track_id:
-                                locked_entry = entry
-                                break
-                    
-                    # Check if we should switch speakers based on LIP ACTIVITY
-                    time_with_current = ts - lock_start_time
-                    should_switch = False
-                    best_other_entry = None
-                    
-                    if locked_entry is None:
-                        # Current speaker not visible - switch to whoever is speaking most
-                        should_switch = True
-                        # Find entry with most cumulative lip activity
-                        best_other_score = -1.0
-                        for entry in assigned_entries:
-                            tid = entry.get("track_id")
-                            score = track_lip_activity.get(tid, 0.0)
-                            if score > best_other_score:
-                                best_other_score = score
-                                best_other_entry = entry
-                    elif time_with_current >= SPEAKER_LOCK_MIN_DURATION:
-                        # Enough time has passed - check if another speaker has more lip activity
-                        current_lip_score = track_lip_activity.get(locked_track_id, 0.0)
-                        
-                        for entry in assigned_entries:
-                            tid = entry.get("track_id")
-                            if tid != locked_track_id:
-                                other_lip_score = track_lip_activity.get(tid, 0.0)
-                                # Only switch if other person has significantly more lip movement
-                                # This means they've been speaking more
-                                if other_lip_score > current_lip_score * SPEAKER_SWITCH_THRESHOLD:
-                                    should_switch = True
-                                    lip_speaking_detections += 1
-                                    if best_other_entry is None or other_lip_score > track_lip_activity.get(best_other_entry.get("track_id"), 0.0):
-                                        best_other_entry = entry
-                    
-                    if should_switch and best_other_entry is not None:
-                        active_entry = best_other_entry
-                        locked_track_id = active_entry.get("track_id")
-                        lock_start_time = ts
-                        # Reset lip activity scores when switching to give new speaker fair tracking
-                        track_lip_activity = {locked_track_id: track_lip_activity.get(locked_track_id, 0.0)}
-                    else:
-                        # Stay with current speaker
-                        active_entry = locked_entry if locked_entry else max(assigned_entries, key=lambda d: track_lip_activity.get(d.get("track_id"), 0.0))
-
-            if active_entry is None:
-                # No face detected this frame
-                if last_center is None:
-                    # Haven't seen any face yet; skip this sample
-                    continue
-                gap = ts - last_detection_time
-                if gap > FACE_RECENTER_AFTER:
-                    blend = min((gap - FACE_RECENTER_AFTER) / FACE_RECENTER_AFTER, 1.0)
-                    last_center = last_center * (1.0 - blend) + 0.5 * blend
-                # Apply position smoothing
-                if smoothed_center is None:
-                    smoothed_center = last_center
-                else:
-                    smoothed_center = smoothed_center * SPEAKER_POSITION_SMOOTHING + last_center * (1.0 - SPEAKER_POSITION_SMOOTHING)
-                samples.append({
-                    "time": ts,
-                    "center": smoothed_center,
-                    "track_id": last_track_id
-                })
-            else:
-                last_center = active_entry["center"]
-                last_track_id = active_entry.get("track_id")
-                last_detection_time = ts
-                # Apply position smoothing to prevent jarring jumps
-                if smoothed_center is None:
-                    smoothed_center = last_center
-                else:
-                    smoothed_center = smoothed_center * SPEAKER_POSITION_SMOOTHING + last_center * (1.0 - SPEAKER_POSITION_SMOOTHING)
-                samples.append({
-                    "time": ts,
-                    "center": smoothed_center,
-                    "track_id": last_track_id
-                })
-
-    # Clean up detectors
-    if face_landmarker is not None and hasattr(face_landmarker, "close"):
-        face_landmarker.close()
-
-    # If no faces were detected at all, return a single centered sample
-    if not samples:
-        print(f"[FaceTracking] No faces detected in clip {clip_start:.2f}-{clip_end:.2f}s; using center crop.")
-        samples = [
-            {"time": clip_start, "center": 0.5, "track_id": None},
-            {"time": clip_end, "center": 0.5, "track_id": None}
-        ]
-    else:
-        # Log tracking summary with lip detection stats
-        centers = [s["center"] for s in samples]
-        avg_center = sum(centers) / len(centers)
-        
-        # Count unique track IDs to see how many speaker switches occurred
-        track_changes = 0
-        prev_tid = None
-        for s in samples:
-            if s.get("track_id") != prev_tid and prev_tid is not None:
-                track_changes += 1
-            prev_tid = s.get("track_id")
-        
-        # Log lip activity summary
-        lip_summary = ", ".join([f"track{tid}={score:.4f}" for tid, score in sorted(track_lip_activity.items())])
-        print(f"[FaceTracking] Clip {clip_start:.2f}-{clip_end:.2f}s: "
-              f"{len(samples)} samples, avg center={avg_center:.3f}, "
-              f"range=[{min(centers):.3f}, {max(centers):.3f}], "
-              f"speaker switches={track_changes}")
-        if detector_backend == "landmarker":
-            print(f"[FaceTracking] Lip activity: {lip_summary}")
-            print(f"[FaceTracking] Multi-face frames: {total_multi_face_frames}, lip-based switches: {lip_speaking_detections}")
-
-    return samples
-
-
 def build_speaker_segments(
     samples: List[Dict],
     clip_start: float,
@@ -2401,151 +2127,6 @@ def crop_x_expression_for_segments(
 # ==========================
 # STEP 5A-2: MULTI-SPEAKER LAYOUT DETECTION
 # ==========================
-
-def compute_multi_speaker_samples(
-    input_video: str,
-    clip_start: float,
-    clip_end: float,
-    analysis_fps: float = FACE_ANALYSIS_FPS
-) -> Tuple[List[Dict], Dict[int, List[Dict]]]:
-    """
-    Enhanced face tracking that returns:
-    1. samples: List of frame samples with all detected faces
-    2. tracks: Dict mapping track_id to list of detections over time
-    
-    Each sample contains:
-    - time: timestamp
-    - faces: list of detected faces with center, width, activity
-    - num_faces: count of faces detected
-    """
-    if cv2 is None:
-        return [], {}
-
-    detector_backend = "none"
-    face_landmarker = None
-    cascade = None
-
-    # Priority 1: FaceLandmarker
-    if MP_HAS_TASKS:
-        model_path = ensure_face_landmarker_model()
-        if model_path:
-            try:
-                base_options = mp_tasks_python.BaseOptions(model_asset_path=model_path)
-                landmarker_options = mp_tasks_vision.FaceLandmarkerOptions(
-                    base_options=base_options,
-                    output_face_blendshapes=False,
-                    output_facial_transformation_matrixes=False,
-                    num_faces=4,
-                    min_face_detection_confidence=FACE_MIN_CONFIDENCE,
-                    min_face_presence_confidence=FACE_MIN_CONFIDENCE,
-                    min_tracking_confidence=0.5
-                )
-                face_landmarker = mp_tasks_vision.FaceLandmarker.create_from_options(landmarker_options)
-                detector_backend = "landmarker"
-            except Exception as exc:
-                print(f"[MultiSpeaker] FaceLandmarker unavailable ({exc}); falling back.")
-
-    # Priority 2: Haar cascade
-    if detector_backend == "none":
-        cascade = _load_haar_cascade()
-        if cascade is None:
-            print("[MultiSpeaker] No face detector available.")
-            return [], {}
-        detector_backend = "haar"
-
-    print(f"[MultiSpeaker] Using '{detector_backend}' for layout detection")
-
-    tracks: List[Dict] = []
-    next_track_id = 0
-    samples: List[Dict] = []
-    track_detections: Dict[int, List[Dict]] = {}
-    track_mouth_history: Dict[int, List[float]] = {}
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        frames_with_ts = _extract_frames_with_ffmpeg(
-            input_video,
-            clip_start,
-            clip_end,
-            analysis_fps,
-            temp_dir
-        )
-        
-        if not frames_with_ts:
-            return [], {}
-        
-        for ts, frame_path in frames_with_ts:
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                continue
-
-            if detector_backend == "landmarker" and face_landmarker is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                detections = _detect_faces_with_landmarker(face_landmarker, rgb)
-            else:
-                detections = _detect_faces_with_cascade(cascade, frame)
-
-            frame_faces = []
-            for det in detections:
-                # Match to existing track
-                best_track = None
-                best_dist = 1.0
-                for track in tracks:
-                    if ts - track["last_time"] > FACE_TRACK_MAX_GAP:
-                        continue
-                    dist = abs(det["center"] - track["center"])
-                    if dist < FACE_TRACK_DISTANCE and dist < best_dist:
-                        best_track = track
-                        best_dist = dist
-
-                if best_track is None:
-                    best_track = {
-                        "id": next_track_id,
-                        "center": det["center"],
-                        "last_time": ts
-                    }
-                    tracks.append(best_track)
-                    track_detections[next_track_id] = []
-                    next_track_id += 1
-
-                best_track["center"] = det["center"]
-                best_track["last_time"] = ts
-                tid = best_track["id"]
-                
-                # Compute lip movement
-                mouth_open = det.get("mouth_open", 0.0)
-                if tid not in track_mouth_history:
-                    track_mouth_history[tid] = []
-                
-                history = track_mouth_history[tid]
-                lip_movement = 0.0
-                if len(history) >= 1:
-                    lip_movement = abs(mouth_open - history[-1])
-                
-                history.append(mouth_open)
-                if len(history) > LIP_MOVEMENT_HISTORY_FRAMES:
-                    history.pop(0)
-                
-                face_info = {
-                    "track_id": tid,
-                    "center": det["center"],
-                    "width": det.get("width", 0.1),
-                    "activity": lip_movement,
-                    "time": ts
-                }
-                frame_faces.append(face_info)
-                track_detections[tid].append(face_info)
-            
-            samples.append({
-                "time": ts,
-                "faces": frame_faces,
-                "num_faces": len(frame_faces)
-            })
-
-    if face_landmarker is not None and hasattr(face_landmarker, "close"):
-        face_landmarker.close()
-
-    return samples, track_detections
-
 
 def determine_layout_segments(
     samples: List[Dict],
@@ -2925,8 +2506,8 @@ def create_vertical_with_subs(
         "-vf", vf,
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -3023,8 +2604,8 @@ def create_split_screen_clip(
         "-map", "0:a?",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -3097,8 +2678,8 @@ def create_wide_shot_clip(
         "-map", "0:a?",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -3244,8 +2825,8 @@ def create_multi_layout_clip(
             "-i", temp_concat,
             "-vf", vf,
             "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
+            "-preset", cfg.video.ffmpeg_preset,
+            "-crf", str(cfg.video.ffmpeg_crf),
             "-c:a", "copy",
             "-movflags", "+faststart",
             output_video
@@ -3278,8 +2859,8 @@ def _render_single_segment(
         "-vf", f"scale=-2:{target_h},crop={target_w}:{target_h}:'{x_expr}':0",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         output_path
@@ -3328,8 +2909,8 @@ def _render_split_segment(
         "-map", "0:a?",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         output_path
@@ -3367,8 +2948,8 @@ def _render_wide_segment(
         "-map", "0:a?",
         "-r", str(fps),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", cfg.video.ffmpeg_preset,
+        "-crf", str(cfg.video.ffmpeg_crf),
         "-c:a", "aac",
         "-b:a", "128k",
         output_path
@@ -3445,6 +3026,7 @@ Examples:
   python video_highlight.py                    # Basic highlight generation
   python video_highlight.py --hook             # Enable auto-hook overlay
   python video_highlight.py --hook --layout split  # Hook + forced split layout
+  python video_highlight.py --fast             # Fast mode for quick iterations
         """
     )
     
@@ -3452,6 +3034,12 @@ Examples:
         "--hook",
         action="store_true",
         help="Enable auto-hook overlay - adds attention-grabbing text at the top of each clip"
+    )
+    
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast mode for development - uses ultrafast encoding and reduced analysis (5-10x faster)"
     )
     
     parser.add_argument(
@@ -3493,6 +3081,10 @@ def main():
     if args.hook:
         cfg.hook.enabled = True
         print("[Config] Auto-hook overlay ENABLED")
+    
+    if args.fast:
+        cfg.enable_fast_mode()
+        print("[Config] Fast mode ENABLED (ultrafast preset, reduced analysis)")
     
     if args.layout:
         cfg.layout.mode = args.layout
