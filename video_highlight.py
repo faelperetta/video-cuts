@@ -7,6 +7,7 @@ import urllib.request
 import tempfile
 import glob
 import argparse
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import statistics
 from contextlib import nullcontext
@@ -39,127 +40,279 @@ if mp is not None:
 
 
 # ==========================
-# CONFIG
+# CONFIGURATION DATACLASSES
 # ==========================
 
-INPUT_VIDEO = "input.webm"              # Your source video
-SRT_FILE = "subs.srt"                  # Full-video subtitles
-AUDIO_WAV = "audio.wav"                # Extracted audio
+@dataclass
+class VideoConfig:
+    """Video format and output settings."""
+    target_width: int = 1080
+    target_height: int = 1920
+    output_fps: int = 30
 
-OUTPUT_DIR = "highlights"              # Folder for output clips
-FINAL_OUTPUT = "final_highlight.mp4"   # Single best highlight
 
-# Choose one: "coding", "fitness", "gaming"
-CONTENT_TYPE = "coding"
+@dataclass
+class HighlightConfig:
+    """Highlight selection and timing parameters."""
+    min_length: float = 15.0          # seconds
+    max_length: float = 45.0          # seconds
+    context_before: float = 1.5       # seconds before high-scoring segment
+    context_after: float = 1.5        # seconds after high-scoring segment
+    num_highlights: int = 3           # how many clips to export
+    min_gap: float = 4.0              # seconds between clips
+    last_word_pad: float = 0.25       # buffer to ensure last word finishes
 
-# Video format for Shorts/Reels/TikTok
-TARGET_WIDTH = 1080
-TARGET_HEIGHT = 1920
-OUTPUT_FPS = 30
 
-# Whisper model size: "tiny", "base", "small", "medium", "large"
-WHISPER_MODEL_SIZE = "small"
+@dataclass
+class FaceTrackingConfig:
+    """Face detection and tracking parameters."""
+    min_confidence: float = 0.45      # mediapipe detection confidence
+    analysis_fps: float = 12.0        # sampling FPS for face tracking
+    track_distance: float = 0.12      # max normalized horizontal delta for same track
+    track_max_gap: float = 1.0        # seconds before track is recycled
+    activity_threshold: float = 0.0035  # threshold for choosing active speaker
+    recenter_after: float = 0.35      # seconds without detection before easing to center
 
-# Sentiment model (text-based emotional intensity)
-SENTIMENT_MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
-# Highlight selection
-MIN_HIGHLIGHT_LEN = 15      # seconds
-MAX_HIGHLIGHT_LEN = 45.0     # seconds
-CONTEXT_BEFORE = 1.5         # seconds before a high-scoring segment
-CONTEXT_AFTER = 1.5          # seconds after a high-scoring segment
-NUM_HIGHLIGHTS = 3           # how many clips to export
-MIN_GAP_BETWEEN_HIGHLIGHTS = 4.0  # seconds of separation between clips
-LAST_WORD_PAD = 0.25         # small buffer to ensure last word finishes
-FACE_MIN_CONFIDENCE = 0.45   # mediapipe detection confidence
-FACE_ANALYSIS_FPS = 12.0     # sampling FPS for face tracking inside a clip
-FACE_TRACK_DISTANCE = 0.12   # max normalized horizontal delta to keep same track
-FACE_TRACK_MAX_GAP = 1.0     # seconds a track can go unseen before recycled
-SPEAKER_ACTIVITY_THRESHOLD = 0.0035  # threshold for choosing active speaker
-FACE_RECENTER_AFTER = 0.35    # seconds without detection before easing to center
+@dataclass
+class SpeakerLockConfig:
+    """Speaker lock parameters to prevent jittery switching."""
+    min_duration: float = 3.0         # minimum seconds before switching
+    switch_threshold: float = 2.0     # other speaker needs 2x more activity to switch
+    smoothing_window: float = 0.5     # seconds of smoothing for crop position
+    position_smoothing: float = 0.5   # blend factor (0=instant, 1=no change)
 
-# Speaker lock parameters - prevents jittery switching between people
-SPEAKER_LOCK_MIN_DURATION = 3.0     # minimum seconds to stay with a speaker before switching
-SPEAKER_SWITCH_THRESHOLD = 2.0      # other speaker must have 2x more cumulative lip activity to switch
-SPEAKER_SMOOTHING_WINDOW = 0.5      # seconds of smoothing for crop position
-SPEAKER_POSITION_SMOOTHING = 0.5    # blend factor for position smoothing (0=instant, 1=no change)
 
-# Segment smoothing - eliminates jitter from micro-segments
-MIN_SEGMENT_DURATION = 0.5          # minimum segment duration in seconds (shorter segments get merged)
-SEGMENT_MERGE_THRESHOLD = 0.15      # merge segments with centers within this distance
-SEGMENT_ABSORB_THRESHOLD = 0.3      # very short segments absorbed if neighbor is within this distance
+@dataclass
+class SegmentSmoothingConfig:
+    """Segment smoothing to eliminate jitter from micro-segments."""
+    min_duration: float = 0.5         # minimum segment duration in seconds
+    merge_threshold: float = 0.15     # merge segments with centers within this distance
+    absorb_threshold: float = 0.3     # absorb very short segments within this distance
 
-# Lip movement detection - for identifying who is speaking
-LIP_MOVEMENT_HISTORY_FRAMES = 5     # number of frames to track for lip movement delta
-LIP_MOVEMENT_MIN_DELTA = 0.003      # minimum change in mouth opening to count as "speaking"
-LIP_SPEAKING_THRESHOLD = 0.008      # cumulative lip movement to consider someone speaking
 
-# Animated Caption Style Configuration
-CAPTION_FONT_NAME = "Arial"         # Font family for captions
-CAPTION_FONT_SIZE = 58              # Font size in pixels
-CAPTION_PRIMARY_COLOR = "&H00FFFFFF"  # White (AABBGGRR format)
-CAPTION_HIGHLIGHT_COLOR = "&H0000FF00"  # Bright green for current word
-CAPTION_OUTLINE_COLOR = "&H00000000"  # Black outline
-CAPTION_BACK_COLOR = "&H80000000"     # Semi-transparent black background
-CAPTION_OUTLINE_WIDTH = 3           # Outline thickness
-CAPTION_SHADOW_DEPTH = 2            # Shadow depth
-CAPTION_MARGIN_V = 120              # Vertical margin from bottom
-CAPTION_WORDS_PER_LINE = 4          # Max words per caption line
-CAPTION_USE_WORD_HIGHLIGHT = True   # Enable word-by-word highlighting
+@dataclass
+class LipDetectionConfig:
+    """Lip movement detection for identifying who is speaking."""
+    history_frames: int = 5           # frames to track for lip movement delta
+    min_delta: float = 0.003          # minimum change to count as "speaking"
+    speaking_threshold: float = 0.008  # cumulative movement to consider speaking
 
-# Auto-Hook Overlay Configuration
-HOOK_ENABLED = False                # Controlled by --hook CLI flag
-HOOK_SCAN_SECONDS = 5.0             # Seconds at start of clip to scan for hook
-HOOK_MIN_WORDS = 3                  # Minimum words for a valid hook
-HOOK_MAX_WORDS = 10                 # Maximum words to display
-HOOK_FONT_NAME = "Arial"            # Font for hook overlay
-HOOK_FONT_SIZE = 42                 # Font size for hook text
-HOOK_PRIMARY_COLOR = "black"        # Hook text color (FFmpeg format)
-HOOK_BG_COLOR = "white"             # White background like OpusClip
-HOOK_BG_OPACITY = 0.95              # Background opacity (0-1)
-HOOK_POSITION_Y = 120               # Vertical position from top
-HOOK_FADE_IN_DURATION = 0.3         # Fade-in duration in seconds
-HOOK_DISPLAY_DURATION = 3.0         # How long hook stays visible (after fade)
-HOOK_FADE_OUT_DURATION = 0.3        # Fade-out duration in seconds
-HOOK_BOX_PADDING = 20               # Padding around hook text
-HOOK_BOX_BORDER_W = 24              # Horizontal padding for box
-HOOK_SHADOW_COLOR = "black@0.3"     # Subtle shadow for depth
 
-# Multi-Speaker Layout Configuration
-LAYOUT_MODE = "auto"                # "auto", "single", "split", "wide"
-LAYOUT_SPLIT_THRESHOLD = 0.35       # Min horizontal distance between faces to trigger split-screen
-LAYOUT_WIDE_THRESHOLD = 0.25        # Max distance to use wide shot instead of split
-LAYOUT_MIN_FACES_FOR_SPLIT = 2      # Minimum faces needed for split-screen
-LAYOUT_SPLIT_GAP = 20               # Pixels between split panels
-LAYOUT_BOTH_SPEAKING_WINDOW = 1.5   # Seconds window to detect both speakers active
-LAYOUT_BOTH_SPEAKING_RATIO = 0.3    # If both have >30% of max activity, consider both active
-LAYOUT_SEGMENT_MIN_DURATION = 2.0   # Minimum duration for a layout segment
-LAYOUT_WIDE_ZOOM = 0.85             # Zoom factor for wide shot (0.85 = show 85% width)
+@dataclass
+class CaptionConfig:
+    """Animated caption style configuration."""
+    font_name: str = "Arial"
+    font_size: int = 58
+    primary_color: str = "&H00FFFFFF"    # White (AABBGGRR format)
+    highlight_color: str = "&H0000FF00"  # Bright green for current word
+    outline_color: str = "&H00000000"    # Black outline
+    back_color: str = "&H80000000"       # Semi-transparent black background
+    outline_width: int = 3
+    shadow_depth: int = 2
+    margin_v: int = 120                  # Vertical margin from bottom
+    words_per_line: int = 4
+    use_word_highlight: bool = True      # Enable word-by-word highlighting
 
-FACE_DETECTOR_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_detection/"
-    "short_range/float16/1/face_detection_short_range.tflite"
-)
-FACE_DETECTOR_MODEL_PATH = os.path.join(
-    OUTPUT_DIR,
-    "models",
-    "face_detection_short_range.tflite"
-)
 
-# Face Landmarker model (for lip detection)
-FACE_LANDMARKER_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
-FACE_LANDMARKER_MODEL_PATH = os.path.join(
-    OUTPUT_DIR,
-    "models",
-    "face_landmarker.task"
-)
+@dataclass
+class HookConfig:
+    """Auto-hook overlay configuration."""
+    enabled: bool = False             # Controlled by --hook CLI flag
+    scan_seconds: float = 5.0         # Seconds at start to scan for hook
+    min_words: int = 3
+    max_words: int = 10
+    font_name: str = "Arial"
+    font_size: int = 42
+    primary_color: str = "black"      # Hook text color (FFmpeg format)
+    bg_color: str = "white"           # White background like OpusClip
+    bg_opacity: float = 0.95
+    position_y: int = 120             # Vertical position from top
+    fade_in: float = 0.3              # Fade-in duration in seconds
+    display_duration: float = 3.0     # How long hook stays visible
+    fade_out: float = 0.3             # Fade-out duration in seconds
+    box_padding: int = 20
+    box_border_w: int = 24
+    shadow_color: str = "black@0.3"
 
-# Reuse existing intermediates when possible
-FORCE_TRANSCRIBE = False
-FORCE_AUDIO_EXTRACTION = False
+
+@dataclass
+class LayoutConfig:
+    """Multi-speaker layout configuration."""
+    mode: str = "auto"                # "auto", "single", "split", "wide"
+    split_threshold: float = 0.35     # Min distance to trigger split-screen
+    wide_threshold: float = 0.25      # Max distance for wide shot
+    min_faces_for_split: int = 2
+    split_gap: int = 20               # Pixels between split panels
+    both_speaking_window: float = 1.5  # Seconds to detect both speakers active
+    both_speaking_ratio: float = 0.3   # Both have >30% of max activity
+    segment_min_duration: float = 2.0
+    wide_zoom: float = 0.85           # Zoom factor for wide shot
+
+
+@dataclass
+class ModelConfig:
+    """Model paths and settings."""
+    whisper_size: str = "small"
+    sentiment_model: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    face_detector_url: str = (
+        "https://storage.googleapis.com/mediapipe-models/face_detection/"
+        "short_range/float16/1/face_detection_short_range.tflite"
+    )
+    face_landmarker_url: str = (
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+        "face_landmarker/float16/1/face_landmarker.task"
+    )
+
+
+@dataclass
+class PathConfig:
+    """File paths and directories."""
+    input_video: str = "input.webm"
+    srt_file: str = "subs.srt"
+    audio_wav: str = "audio.wav"
+    output_dir: str = "highlights"
+    final_output: str = "final_highlight.mp4"
+    
+    @property
+    def face_detector_model(self) -> str:
+        return os.path.join(self.output_dir, "models", "face_detection_short_range.tflite")
+    
+    @property
+    def face_landmarker_model(self) -> str:
+        return os.path.join(self.output_dir, "models", "face_landmarker.task")
+
+
+@dataclass
+class Config:
+    """Main configuration container combining all settings."""
+    paths: PathConfig = field(default_factory=PathConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)
+    highlight: HighlightConfig = field(default_factory=HighlightConfig)
+    face_tracking: FaceTrackingConfig = field(default_factory=FaceTrackingConfig)
+    speaker_lock: SpeakerLockConfig = field(default_factory=SpeakerLockConfig)
+    segment_smoothing: SegmentSmoothingConfig = field(default_factory=SegmentSmoothingConfig)
+    lip_detection: LipDetectionConfig = field(default_factory=LipDetectionConfig)
+    caption: CaptionConfig = field(default_factory=CaptionConfig)
+    hook: HookConfig = field(default_factory=HookConfig)
+    layout: LayoutConfig = field(default_factory=LayoutConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    content_type: str = "coding"      # "coding", "fitness", "gaming"
+    force_transcribe: bool = False
+    force_audio_extraction: bool = False
+
+
+# Global config instance - can be replaced via CLI or programmatically
+cfg = Config()
+
+
+# ==========================
+# CONFIG (Legacy compatibility - maps to cfg dataclass)
+# ==========================
+
+# File paths (access via cfg.paths for new code)
+INPUT_VIDEO = cfg.paths.input_video
+SRT_FILE = cfg.paths.srt_file
+AUDIO_WAV = cfg.paths.audio_wav
+OUTPUT_DIR = cfg.paths.output_dir
+FINAL_OUTPUT = cfg.paths.final_output
+
+# Content type
+CONTENT_TYPE = cfg.content_type
+
+# Video format (access via cfg.video for new code)
+TARGET_WIDTH = cfg.video.target_width
+TARGET_HEIGHT = cfg.video.target_height
+OUTPUT_FPS = cfg.video.output_fps
+
+# Models (access via cfg.model for new code)
+WHISPER_MODEL_SIZE = cfg.model.whisper_size
+SENTIMENT_MODEL_NAME = cfg.model.sentiment_model
+
+# Highlight selection (access via cfg.highlight for new code)
+MIN_HIGHLIGHT_LEN = cfg.highlight.min_length
+MAX_HIGHLIGHT_LEN = cfg.highlight.max_length
+CONTEXT_BEFORE = cfg.highlight.context_before
+CONTEXT_AFTER = cfg.highlight.context_after
+NUM_HIGHLIGHTS = cfg.highlight.num_highlights
+MIN_GAP_BETWEEN_HIGHLIGHTS = cfg.highlight.min_gap
+LAST_WORD_PAD = cfg.highlight.last_word_pad
+
+# Face tracking (access via cfg.face_tracking for new code)
+FACE_MIN_CONFIDENCE = cfg.face_tracking.min_confidence
+FACE_ANALYSIS_FPS = cfg.face_tracking.analysis_fps
+FACE_TRACK_DISTANCE = cfg.face_tracking.track_distance
+FACE_TRACK_MAX_GAP = cfg.face_tracking.track_max_gap
+SPEAKER_ACTIVITY_THRESHOLD = cfg.face_tracking.activity_threshold
+FACE_RECENTER_AFTER = cfg.face_tracking.recenter_after
+
+# Speaker lock (access via cfg.speaker_lock for new code)
+SPEAKER_LOCK_MIN_DURATION = cfg.speaker_lock.min_duration
+SPEAKER_SWITCH_THRESHOLD = cfg.speaker_lock.switch_threshold
+SPEAKER_SMOOTHING_WINDOW = cfg.speaker_lock.smoothing_window
+SPEAKER_POSITION_SMOOTHING = cfg.speaker_lock.position_smoothing
+
+# Segment smoothing (access via cfg.segment_smoothing for new code)
+MIN_SEGMENT_DURATION = cfg.segment_smoothing.min_duration
+SEGMENT_MERGE_THRESHOLD = cfg.segment_smoothing.merge_threshold
+SEGMENT_ABSORB_THRESHOLD = cfg.segment_smoothing.absorb_threshold
+
+# Lip detection (access via cfg.lip_detection for new code)
+LIP_MOVEMENT_HISTORY_FRAMES = cfg.lip_detection.history_frames
+LIP_MOVEMENT_MIN_DELTA = cfg.lip_detection.min_delta
+LIP_SPEAKING_THRESHOLD = cfg.lip_detection.speaking_threshold
+
+# Caption style (access via cfg.caption for new code)
+CAPTION_FONT_NAME = cfg.caption.font_name
+CAPTION_FONT_SIZE = cfg.caption.font_size
+CAPTION_PRIMARY_COLOR = cfg.caption.primary_color
+CAPTION_HIGHLIGHT_COLOR = cfg.caption.highlight_color
+CAPTION_OUTLINE_COLOR = cfg.caption.outline_color
+CAPTION_BACK_COLOR = cfg.caption.back_color
+CAPTION_OUTLINE_WIDTH = cfg.caption.outline_width
+CAPTION_SHADOW_DEPTH = cfg.caption.shadow_depth
+CAPTION_MARGIN_V = cfg.caption.margin_v
+CAPTION_WORDS_PER_LINE = cfg.caption.words_per_line
+CAPTION_USE_WORD_HIGHLIGHT = cfg.caption.use_word_highlight
+
+# Hook overlay (access via cfg.hook for new code)
+HOOK_ENABLED = cfg.hook.enabled
+HOOK_SCAN_SECONDS = cfg.hook.scan_seconds
+HOOK_MIN_WORDS = cfg.hook.min_words
+HOOK_MAX_WORDS = cfg.hook.max_words
+HOOK_FONT_NAME = cfg.hook.font_name
+HOOK_FONT_SIZE = cfg.hook.font_size
+HOOK_PRIMARY_COLOR = cfg.hook.primary_color
+HOOK_BG_COLOR = cfg.hook.bg_color
+HOOK_BG_OPACITY = cfg.hook.bg_opacity
+HOOK_POSITION_Y = cfg.hook.position_y
+HOOK_FADE_IN_DURATION = cfg.hook.fade_in
+HOOK_DISPLAY_DURATION = cfg.hook.display_duration
+HOOK_FADE_OUT_DURATION = cfg.hook.fade_out
+HOOK_BOX_PADDING = cfg.hook.box_padding
+HOOK_BOX_BORDER_W = cfg.hook.box_border_w
+HOOK_SHADOW_COLOR = cfg.hook.shadow_color
+
+# Layout (access via cfg.layout for new code)
+LAYOUT_MODE = cfg.layout.mode
+LAYOUT_SPLIT_THRESHOLD = cfg.layout.split_threshold
+LAYOUT_WIDE_THRESHOLD = cfg.layout.wide_threshold
+LAYOUT_MIN_FACES_FOR_SPLIT = cfg.layout.min_faces_for_split
+LAYOUT_SPLIT_GAP = cfg.layout.split_gap
+LAYOUT_BOTH_SPEAKING_WINDOW = cfg.layout.both_speaking_window
+LAYOUT_BOTH_SPEAKING_RATIO = cfg.layout.both_speaking_ratio
+LAYOUT_SEGMENT_MIN_DURATION = cfg.layout.segment_min_duration
+LAYOUT_WIDE_ZOOM = cfg.layout.wide_zoom
+
+# Model paths (computed from output_dir)
+FACE_DETECTOR_MODEL_URL = cfg.model.face_detector_url
+FACE_DETECTOR_MODEL_PATH = cfg.paths.face_detector_model
+FACE_LANDMARKER_MODEL_URL = cfg.model.face_landmarker_url
+FACE_LANDMARKER_MODEL_PATH = cfg.paths.face_landmarker_model
+
+# Processing flags
+FORCE_TRANSCRIBE = cfg.force_transcribe
+FORCE_AUDIO_EXTRACTION = cfg.force_audio_extraction
 
 
 # ==========================
@@ -3333,70 +3486,75 @@ Examples:
 
 
 def main():
-    global LAYOUT_MODE, CONTENT_TYPE, INPUT_VIDEO, NUM_HIGHLIGHTS, HOOK_ENABLED
-    
+    """Main pipeline entry point."""
     args = parse_args()
     
-    # Apply CLI overrides
+    # Apply CLI overrides to the global config
     if args.hook:
-        HOOK_ENABLED = True
+        cfg.hook.enabled = True
         print("[Config] Auto-hook overlay ENABLED")
     
     if args.layout:
-        LAYOUT_MODE = args.layout
+        cfg.layout.mode = args.layout
         
     if args.content_type:
-        CONTENT_TYPE = args.content_type
+        cfg.content_type = args.content_type
         
     if args.input:
-        INPUT_VIDEO = args.input
+        cfg.paths.input_video = args.input
         
     if args.num_clips:
-        NUM_HIGHLIGHTS = args.num_clips
+        cfg.highlight.num_highlights = args.num_clips
     
-    if not os.path.exists(INPUT_VIDEO):
-        raise FileNotFoundError(f"Input video not found: {INPUT_VIDEO}")
+    # Use cfg for all references
+    input_video = cfg.paths.input_video
+    srt_file = cfg.paths.srt_file
+    audio_wav = cfg.paths.audio_wav
+    output_dir = cfg.paths.output_dir
+    
+    if not os.path.exists(input_video):
+        raise FileNotFoundError(f"Input video not found: {input_video}")
 
-    niche_cfg = get_niche_config(CONTENT_TYPE)
+    niche_cfg = get_niche_config(cfg.content_type)
     hook_keywords = niche_cfg["HOOK_KEYWORDS"]
     weights = niche_cfg["WEIGHTS"]
 
-    print(f"[Config] CONTENT_TYPE='{CONTENT_TYPE}'")
-    print(f"[Config] LAYOUT_MODE='{LAYOUT_MODE}'")
+    print(f"[Config] content_type='{cfg.content_type}'")
+    print(f"[Config] layout.mode='{cfg.layout.mode}'")
     print(f"[Config] Using niche-specific hooks and weights.")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    video_mtime = os.path.getmtime(INPUT_VIDEO)
+    os.makedirs(output_dir, exist_ok=True)
+    video_mtime = os.path.getmtime(input_video)
 
     # 1) Transcribe to SRT + get Whisper segments (PyTorch)
-    if not FORCE_TRANSCRIBE and cache_is_fresh(SRT_FILE, video_mtime):
-        print(f"[Whisper] Reusing cached transcription '{SRT_FILE}'.")
-        segments = parse_srt_to_segments(SRT_FILE)
+    if not cfg.force_transcribe and cache_is_fresh(srt_file, video_mtime):
+        print(f"[Whisper] Reusing cached transcription '{srt_file}'.")
+        segments = parse_srt_to_segments(srt_file)
         if not segments:
             print("[Whisper] Cached SRT could not be parsed, re-transcribing...")
             segments = transcribe_to_srt_and_segments(
-                INPUT_VIDEO,
-                SRT_FILE,
-                WHISPER_MODEL_SIZE
+                input_video,
+                srt_file,
+                cfg.model.whisper_size
             )
     else:
         segments = transcribe_to_srt_and_segments(
-            INPUT_VIDEO,
-            SRT_FILE,
-            WHISPER_MODEL_SIZE
+            input_video,
+            srt_file,
+            cfg.model.whisper_size
         )
 
     # 2) Extract audio once (for torchaudio analysis)
-    if not FORCE_AUDIO_EXTRACTION and cache_is_fresh(AUDIO_WAV, video_mtime):
-        print(f"[Audio] Reusing cached audio '{AUDIO_WAV}'.")
+    if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
+        print(f"[Audio] Reusing cached audio '{audio_wav}'.")
     else:
-        extract_audio(INPUT_VIDEO, AUDIO_WAV)
+        extract_audio(input_video, audio_wav)
 
     # 3) Compute audio RMS per segment
-    rms_values = compute_rms_per_segment(AUDIO_WAV, segments)
+    rms_values = compute_rms_per_segment(audio_wav, segments)
 
     # 4) Load sentiment model and score segments with niche config
-    tokenizer, sentiment_model = load_sentiment_model(SENTIMENT_MODEL_NAME)
+    tokenizer, sentiment_model = load_sentiment_model(cfg.model.sentiment_model)
     scored_segments = score_segments_for_highlights(
         segments,
         rms_values,
@@ -3406,17 +3564,17 @@ def main():
         weights
     )
 
-    # 5) Pick up to NUM_HIGHLIGHTS viral-friendly intervals
+    # 5) Pick up to num_highlights viral-friendly intervals
     highlight_intervals = select_highlight_intervals(
         scored_segments,
         segments,
-        num_highlights=NUM_HIGHLIGHTS,
-        min_len=MIN_HIGHLIGHT_LEN,
-        max_len=MAX_HIGHLIGHT_LEN,
-        ctx_before=CONTEXT_BEFORE,
-        ctx_after=CONTEXT_AFTER,
-        min_gap=MIN_GAP_BETWEEN_HIGHLIGHTS,
-        last_word_pad=LAST_WORD_PAD
+        num_highlights=cfg.highlight.num_highlights,
+        min_len=cfg.highlight.min_length,
+        max_len=cfg.highlight.max_length,
+        ctx_before=cfg.highlight.context_before,
+        ctx_after=cfg.highlight.context_after,
+        min_gap=cfg.highlight.min_gap,
+        last_word_pad=cfg.highlight.last_word_pad
     )
 
     if not highlight_intervals:
@@ -3429,15 +3587,15 @@ def main():
         duration = clip_end - clip_start
 
         if idx == 0:
-            output_name = FINAL_OUTPUT
+            output_name = cfg.paths.final_output
         else:
             output_name = f"highlight_{idx+1:02}.mp4"
 
-        output_path = os.path.join(OUTPUT_DIR, output_name)
+        output_path = os.path.join(output_dir, output_name)
         
         # Generate animated ASS subtitles with word-by-word highlighting
         clip_ass_name = f"{os.path.splitext(output_name)[0]}_subs.ass"
-        clip_ass_path = os.path.join(OUTPUT_DIR, clip_ass_name)
+        clip_ass_path = os.path.join(output_dir, clip_ass_name)
         write_clip_ass(segments, clip_start, clip_end, clip_ass_path)
 
         speaker_segments = []
@@ -3448,7 +3606,7 @@ def main():
             # UNIFIED face analysis - single frame extraction pass
             print(f"\n[Clip {idx+1}] Running unified face analysis...")
             face_analysis = analyze_clip_faces(
-                INPUT_VIDEO,
+                input_video,
                 clip_start,
                 clip_end
             )
@@ -3478,7 +3636,7 @@ def main():
                       f"both speaking={metrics.get('pct_both_speaking', 0):.0f}%")
             
             # Use recommended layout if in auto mode, otherwise use configured mode
-            effective_layout = recommended_layout if LAYOUT_MODE == "auto" else LAYOUT_MODE
+            effective_layout = recommended_layout if cfg.layout.mode == "auto" else cfg.layout.mode
             
             if effective_layout != "single":
                 layout_segments = determine_layout_segments(
@@ -3490,14 +3648,14 @@ def main():
         
         # Determine effective layout mode for this clip
         effective_layout = "single"
-        if LAYOUT_MODE == "auto" and recommended_layout:
+        if cfg.layout.mode == "auto" and recommended_layout:
             effective_layout = recommended_layout
-        elif LAYOUT_MODE != "single":
-            effective_layout = LAYOUT_MODE
+        elif cfg.layout.mode != "single":
+            effective_layout = cfg.layout.mode
         
         # Detect hook phrase BEFORE creating clip (so we can inline it)
         clip_hook_text = None
-        if HOOK_ENABLED:
+        if cfg.hook.enabled:
             hook_info = detect_hook_phrase(
                 segments,
                 clip_start,
@@ -3514,7 +3672,7 @@ def main():
         # Create clip with appropriate layout (hook inlined in single pass)
         if effective_layout != "single" and layout_segments:
             create_multi_layout_clip(
-                INPUT_VIDEO,
+                input_video,
                 clip_ass_path,
                 output_path,
                 start=clip_start,
@@ -3523,9 +3681,9 @@ def main():
                 speaker_segments=speaker_segments,
                 clip_start=clip_start,
                 clip_end=clip_end,
-                target_w=TARGET_WIDTH,
-                target_h=TARGET_HEIGHT,
-                fps=OUTPUT_FPS,
+                target_w=cfg.video.target_width,
+                target_h=cfg.video.target_height,
+                fps=cfg.video.output_fps,
                 hook_text=clip_hook_text
             )
         else:
@@ -3534,17 +3692,17 @@ def main():
                 speaker_segments,
                 clip_start,
                 clip_end,
-                TARGET_WIDTH
+                cfg.video.target_width
             )
             create_vertical_with_subs(
-                INPUT_VIDEO,
+                input_video,
                 clip_ass_path,
                 output_path,
                 start=clip_start,
                 duration=duration,
-                target_w=TARGET_WIDTH,
-                target_h=TARGET_HEIGHT,
-                fps=OUTPUT_FPS,
+                target_w=cfg.video.target_width,
+                target_h=cfg.video.target_height,
+                fps=cfg.video.output_fps,
                 crop_x_expr=crop_expr,
                 hook_text=clip_hook_text
             )
