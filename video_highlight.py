@@ -6,6 +6,7 @@ import subprocess
 import urllib.request
 import tempfile
 import glob
+import argparse
 from typing import List, Dict, Tuple, Optional
 import statistics
 from contextlib import nullcontext
@@ -105,6 +106,24 @@ CAPTION_SHADOW_DEPTH = 2            # Shadow depth
 CAPTION_MARGIN_V = 120              # Vertical margin from bottom
 CAPTION_WORDS_PER_LINE = 4          # Max words per caption line
 CAPTION_USE_WORD_HIGHLIGHT = True   # Enable word-by-word highlighting
+
+# Auto-Hook Overlay Configuration
+HOOK_ENABLED = False                # Controlled by --hook CLI flag
+HOOK_SCAN_SECONDS = 5.0             # Seconds at start of clip to scan for hook
+HOOK_MIN_WORDS = 3                  # Minimum words for a valid hook
+HOOK_MAX_WORDS = 10                 # Maximum words to display
+HOOK_FONT_NAME = "Arial"            # Font for hook overlay
+HOOK_FONT_SIZE = 42                 # Font size for hook text
+HOOK_PRIMARY_COLOR = "black"        # Hook text color (FFmpeg format)
+HOOK_BG_COLOR = "white"             # White background like OpusClip
+HOOK_BG_OPACITY = 0.95              # Background opacity (0-1)
+HOOK_POSITION_Y = 120               # Vertical position from top
+HOOK_FADE_IN_DURATION = 0.3         # Fade-in duration in seconds
+HOOK_DISPLAY_DURATION = 3.0         # How long hook stays visible (after fade)
+HOOK_FADE_OUT_DURATION = 0.3        # Fade-out duration in seconds
+HOOK_BOX_PADDING = 20               # Padding around hook text
+HOOK_BOX_BORDER_W = 24              # Horizontal padding for box
+HOOK_SHADOW_COLOR = "black@0.3"     # Subtle shadow for depth
 
 # Multi-Speaker Layout Configuration
 LAYOUT_MODE = "auto"                # "auto", "single", "split", "wide"
@@ -614,6 +633,227 @@ def write_clip_ass(
     
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+# ==========================
+# AUTO-HOOK SYSTEM
+# ==========================
+
+def detect_hook_phrase(
+    segments: List[Dict],
+    clip_start: float,
+    clip_end: float,
+    hook_keywords: List[str],
+    scan_seconds: float = HOOK_SCAN_SECONDS,
+    min_words: int = HOOK_MIN_WORDS,
+    max_words: int = HOOK_MAX_WORDS
+) -> Optional[Dict]:
+    """
+    Detect a catchy hook phrase from the first few seconds of a clip.
+    
+    Prioritizes:
+    1. Segments containing hook keywords from niche config
+    2. First complete sentence/phrase if no keywords found
+    
+    Returns dict with:
+    - text: The hook phrase text
+    - start: Start time relative to clip
+    - end: End time relative to clip
+    - has_keyword: Whether a hook keyword was matched
+    """
+    scan_end = clip_start + scan_seconds
+    
+    # Collect segments within scan window
+    scan_segments = []
+    for seg in segments:
+        seg_start = seg.get("start", 0)
+        seg_end = seg.get("end", 0)
+        
+        # Check if segment overlaps with scan window
+        if seg_end >= clip_start and seg_start <= scan_end:
+            text = seg.get("text", "").strip()
+            if text:
+                scan_segments.append({
+                    "text": text,
+                    "start": max(seg_start - clip_start, 0),
+                    "end": min(seg_end - clip_start, clip_end - clip_start),
+                    "words": seg.get("words", [])
+                })
+    
+    if not scan_segments:
+        return None
+    
+    # Priority 1: Find segment with hook keyword
+    for seg in scan_segments:
+        text_lower = seg["text"].lower()
+        for keyword in hook_keywords:
+            if keyword in text_lower:
+                # Found a hook keyword - extract the phrase
+                hook_text = _extract_hook_around_keyword(
+                    seg["text"], 
+                    keyword, 
+                    max_words
+                )
+                if hook_text and len(hook_text.split()) >= min_words:
+                    print(f"[Hook] Found keyword match: '{keyword}' -> '{hook_text}'")
+                    return {
+                        "text": hook_text,
+                        "start": seg["start"],
+                        "end": min(seg["end"], HOOK_DISPLAY_DURATION + HOOK_FADE_IN_DURATION),
+                        "has_keyword": True
+                    }
+    
+    # Priority 2: Use first sentence/phrase as hook
+    combined_text = " ".join(seg["text"] for seg in scan_segments)
+    words = combined_text.split()
+    
+    if len(words) < min_words:
+        return None
+    
+    # Try to find a natural break point (sentence end)
+    hook_words = []
+    for i, word in enumerate(words[:max_words]):
+        hook_words.append(word)
+        # Check for sentence-ending punctuation
+        if word.endswith(('.', '!', '?')) and len(hook_words) >= min_words:
+            break
+    
+    # If no sentence break found, take up to max_words
+    if len(hook_words) < min_words:
+        hook_words = words[:max_words]
+    
+    hook_text = " ".join(hook_words)
+    
+    # Clean up trailing punctuation for display
+    hook_text = hook_text.rstrip('.,;:')
+    
+    if len(hook_text.split()) >= min_words:
+        print(f"[Hook] Using opening phrase: '{hook_text}'")
+        return {
+            "text": hook_text,
+            "start": scan_segments[0]["start"],
+            "end": min(scan_segments[0]["end"], HOOK_DISPLAY_DURATION + HOOK_FADE_IN_DURATION),
+            "has_keyword": False
+        }
+    
+    return None
+
+
+def _extract_hook_around_keyword(
+    text: str, 
+    keyword: str, 
+    max_words: int
+) -> str:
+    """
+    Extract a phrase centered around the hook keyword.
+    Tries to capture context around the keyword for a compelling hook.
+    """
+    text_lower = text.lower()
+    keyword_pos = text_lower.find(keyword)
+    
+    if keyword_pos == -1:
+        return text[:max_words * 10]  # Fallback: return beginning
+    
+    words = text.split()
+    keyword_words = keyword.split()
+    
+    # Find which word index contains the keyword start
+    char_count = 0
+    keyword_start_idx = 0
+    for i, word in enumerate(words):
+        word_end = char_count + len(word)
+        if char_count <= keyword_pos < word_end:
+            keyword_start_idx = i
+            break
+        char_count = word_end + 1  # +1 for space
+    
+    # Calculate how many words to take before/after keyword
+    keyword_len = len(keyword_words)
+    words_before = max(0, (max_words - keyword_len) // 2)
+    words_after = max_words - keyword_len - words_before
+    
+    start_idx = max(0, keyword_start_idx - words_before)
+    end_idx = min(len(words), keyword_start_idx + keyword_len + words_after)
+    
+    result = " ".join(words[start_idx:end_idx])
+    return result
+
+
+def generate_hook_overlay_filter(
+    hook_text: str,
+    target_w: int = TARGET_WIDTH,
+    target_h: int = TARGET_HEIGHT
+) -> str:
+    """
+    Generate FFmpeg filter expression for animated hook overlay.
+    
+    Creates a centered text overlay at the top of the video with:
+    - White background box (OpusClip style)
+    - Black text for readability
+    - Fade-in/out animation
+    - Centered horizontally, compact width
+    """
+    # Escape special characters for FFmpeg drawtext
+    escaped_text = hook_text.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+    
+    # Calculate timing
+    fade_in_end = HOOK_FADE_IN_DURATION
+    visible_end = fade_in_end + HOOK_DISPLAY_DURATION
+    fade_out_end = visible_end + HOOK_FADE_OUT_DURATION
+    
+    # Alpha expression: fade in -> hold -> fade out
+    alpha_expr = (
+        f"if(lt(t,{fade_in_end}),t/{HOOK_FADE_IN_DURATION},"
+        f"if(lt(t,{visible_end}),1,"
+        f"if(lt(t,{fade_out_end}),(({fade_out_end}-t)/{HOOK_FADE_OUT_DURATION}),0)))"
+    )
+    
+    # Box color with opacity for the alpha animation
+    box_color = f"{HOOK_BG_COLOR}@{HOOK_BG_OPACITY}"
+    
+    # Drawtext filter with white box background, centered
+    # Using boxborderw for padding around text
+    drawtext_filter = (
+        f"drawtext=text='{escaped_text}':"
+        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+        f"fontsize={HOOK_FONT_SIZE}:"
+        f"fontcolor={HOOK_PRIMARY_COLOR}:"
+        f"x=(w-text_w)/2:"
+        f"y={HOOK_POSITION_Y}:"
+        f"alpha='{alpha_expr}':"
+        f"box=1:"
+        f"boxcolor={box_color}:"
+        f"boxborderw={HOOK_BOX_PADDING}:"
+        f"shadowcolor={HOOK_SHADOW_COLOR}:"
+        f"shadowx=2:shadowy=2"
+    )
+    
+    return drawtext_filter
+
+
+def apply_hook_overlay(
+    input_video: str,
+    output_video: str,
+    hook_text: str,
+    target_w: int = TARGET_WIDTH,
+    target_h: int = TARGET_HEIGHT
+) -> None:
+    """
+    Apply hook overlay to a video file.
+    Creates a new video with the hook text animation at the top.
+    """
+    hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_video,
+        "-vf", hook_filter,
+        "-c:a", "copy",
+        output_video
+    ]
+    
+    print(f"[Hook] Applying hook overlay: '{hook_text}'")
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 # ==========================
@@ -2700,7 +2940,78 @@ def _get_crop_for_time_range(
 # MAIN PIPELINE
 # ==========================
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Video Highlights Generator - Create viral short-form clips",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python video_highlight.py                    # Basic highlight generation
+  python video_highlight.py --hook             # Enable auto-hook overlay
+  python video_highlight.py --hook --layout split  # Hook + forced split layout
+        """
+    )
+    
+    parser.add_argument(
+        "--hook",
+        action="store_true",
+        help="Enable auto-hook overlay - adds attention-grabbing text at the top of each clip"
+    )
+    
+    parser.add_argument(
+        "--layout",
+        choices=["auto", "single", "split", "wide"],
+        default=None,
+        help="Override layout mode (default: uses LAYOUT_MODE from config)"
+    )
+    
+    parser.add_argument(
+        "--content-type",
+        choices=["coding", "fitness", "gaming"],
+        default=None,
+        help="Override content type for niche-specific scoring"
+    )
+    
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Override input video path"
+    )
+    
+    parser.add_argument(
+        "--num-clips",
+        type=int,
+        default=None,
+        help="Number of highlight clips to generate"
+    )
+    
+    return parser.parse_args()
+
+
 def main():
+    global LAYOUT_MODE, CONTENT_TYPE, INPUT_VIDEO, NUM_HIGHLIGHTS, HOOK_ENABLED
+    
+    args = parse_args()
+    
+    # Apply CLI overrides
+    if args.hook:
+        HOOK_ENABLED = True
+        print("[Config] Auto-hook overlay ENABLED")
+    
+    if args.layout:
+        LAYOUT_MODE = args.layout
+        
+    if args.content_type:
+        CONTENT_TYPE = args.content_type
+        
+    if args.input:
+        INPUT_VIDEO = args.input
+        
+    if args.num_clips:
+        NUM_HIGHLIGHTS = args.num_clips
+    
     if not os.path.exists(INPUT_VIDEO):
         raise FileNotFoundError(f"Input video not found: {INPUT_VIDEO}")
 
@@ -2709,6 +3020,7 @@ def main():
     weights = niche_cfg["WEIGHTS"]
 
     print(f"[Config] CONTENT_TYPE='{CONTENT_TYPE}'")
+    print(f"[Config] LAYOUT_MODE='{LAYOUT_MODE}'")
     print(f"[Config] Using niche-specific hooks and weights.")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -2879,6 +3191,38 @@ def main():
                 fps=OUTPUT_FPS,
                 crop_x_expr=crop_expr
             )
+
+        # Apply auto-hook overlay if enabled
+        if HOOK_ENABLED:
+            hook_info = detect_hook_phrase(
+                segments,
+                clip_start,
+                clip_end,
+                hook_keywords
+            )
+            
+            if hook_info:
+                # Apply hook overlay to the generated clip
+                hook_output_path = output_path.replace(".mp4", "_hooked.mp4")
+                try:
+                    apply_hook_overlay(
+                        output_path,
+                        hook_output_path,
+                        hook_info["text"],
+                        TARGET_WIDTH,
+                        TARGET_HEIGHT
+                    )
+                    # Replace original with hooked version
+                    os.replace(hook_output_path, output_path)
+                    print(f"[Hook] Applied hook to clip {idx+1}: \"{hook_info['text'][:50]}...\"" 
+                          if len(hook_info['text']) > 50 else f"[Hook] Applied hook to clip {idx+1}: \"{hook_info['text']}\"")
+                except subprocess.CalledProcessError as e:
+                    print(f"[Hook] Warning: Failed to apply hook overlay: {e}")
+                    # Clean up temp file if it exists
+                    if os.path.exists(hook_output_path):
+                        os.remove(hook_output_path)
+            else:
+                print(f"[Hook] No suitable hook phrase found for clip {idx+1}")
 
         generated_outputs.append(output_path)
 
