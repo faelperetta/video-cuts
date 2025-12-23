@@ -173,7 +173,7 @@ class PathConfig:
     input_video: str = "input.webm"
     srt_file: str = "subs.srt"
     audio_wav: str = "audio.wav"
-    output_dir: str = "highlights"
+    output_dir: str = "clips_output"
     final_output: str = "final_highlight.mp4"
     
     @property
@@ -3178,10 +3178,8 @@ def main():
         clip_end = interval["end"]
         duration = clip_end - clip_start
 
-        if idx == 0:
-            output_name = cfg.paths.final_output
-        else:
-            output_name = f"highlight_{idx+1:02}.mp4"
+        # Sequential naming: clip_1.mp4, clip_2.mp4, clip_3.mp4, etc.
+        output_name = f"clip_{idx + 1}.mp4"
 
         output_path = os.path.join(output_dir, output_name)
         
