@@ -123,19 +123,19 @@ class HookConfig:
     enabled: bool = False             # Controlled by --hook CLI flag
     scan_seconds: float = 5.0         # Seconds at start to scan for hook
     min_words: int = 3
-    max_words: int = 10
+    max_words: int = 12               # Allow slightly longer hooks
     font_name: str = "Arial"
-    font_size: int = 42
+    font_size: int = 52               # Larger font for better visibility
     primary_color: str = "black"      # Hook text color (FFmpeg format)
-    bg_color: str = "white"           # White background like OpusClip
-    bg_opacity: float = 0.95
-    position_y: int = 120             # Vertical position from top
-    fade_in: float = 0.3              # Fade-in duration in seconds
-    display_duration: float = 3.0     # How long hook stays visible
-    fade_out: float = 0.3             # Fade-out duration in seconds
-    box_padding: int = 20
-    box_border_w: int = 24
-    shadow_color: str = "black@0.3"
+    bg_color: str = "yellow"          # Yellow background - stands out more
+    bg_opacity: float = 0.98          # Nearly opaque for better readability
+    position_y: int = 100             # Slightly higher position
+    fade_in: float = 0.4              # Slightly longer fade-in
+    display_duration: float = 4.0     # Longer display time (4 seconds)
+    fade_out: float = 0.5             # Slightly longer fade-out
+    box_padding: int = 28             # More padding around text
+    box_border_w: int = 32            # Larger border
+    shadow_color: str = "black@0.5"   # Stronger shadow for depth
 
 
 @dataclass
@@ -165,6 +165,17 @@ class ModelConfig:
         "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
         "face_landmarker/float16/1/face_landmarker.task"
     )
+
+
+@dataclass
+class LLMConfig:
+    """External LLM configuration for clip identification."""
+    provider: str = "openai"              # "openai" (more providers can be added)
+    model: str = "gpt-4o-mini"             # Model to use
+    enabled: bool = False                  # Auto-enabled if API key is set
+    prompt_template_path: str = "prompt.md"  # Path to the prompt template
+    max_tokens: int = 4000
+    temperature: float = 0.7
 
 
 @dataclass
@@ -199,6 +210,7 @@ class Config:
     hook: HookConfig = field(default_factory=HookConfig)
     layout: LayoutConfig = field(default_factory=LayoutConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     content_type: str = "coding"      # "coding", "fitness", "gaming"
     force_transcribe: bool = False
     force_audio_extraction: bool = False
@@ -957,14 +969,74 @@ def generate_hook_overlay_filter(
     Generate FFmpeg filter expression for animated hook overlay.
     
     Creates a centered text overlay at the top of the video with:
-    - White background box (OpusClip style)
+    - Background box for readability
     - Black text for readability
     - Fade-in/out animation
-    - Centered horizontally, compact width
+    - Centered horizontally with safe margins
+    - Multi-line word wrapping for long text
     """
+    # Define horizontal margin (pixels from each edge)
+    HORIZONTAL_MARGIN = 50
+    MAX_LINES = 3  # Maximum number of lines for the hook
+    
+    # Estimate max characters per line
+    # DejaVuSans-Bold at font size 52 averages about 27px per character
+    usable_width = target_w - (2 * HORIZONTAL_MARGIN) - (2 * HOOK_BOX_PADDING)
+    avg_char_width = HOOK_FONT_SIZE * 0.52
+    chars_per_line = int(usable_width / avg_char_width)
+    
+    # Word-wrap the text into multiple lines
+    display_text = hook_text.strip()
+    words = display_text.split()
+    lines = []
+    current_line = []
+    current_length = 0
+    
+    for word in words:
+        word_length = len(word)
+        # +1 for the space between words
+        if current_length + word_length + (1 if current_line else 0) <= chars_per_line:
+            current_line.append(word)
+            current_length += word_length + (1 if len(current_line) > 1 else 0)
+        else:
+            # Line is full, start a new one
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+            current_length = word_length
+            
+            # Check if we've hit max lines
+            if len(lines) >= MAX_LINES - 1:
+                # Add remaining words to last line with ellipsis if needed
+                remaining = words[words.index(word):]
+                last_line = " ".join(remaining)
+                if len(last_line) > chars_per_line:
+                    last_line = last_line[:chars_per_line - 3].rstrip() + "..."
+                lines.append(last_line)
+                current_line = []
+                break
+    
+    # Add any remaining words
+    if current_line:
+        lines.append(" ".join(current_line))
+    
+    # Limit to MAX_LINES
+    if len(lines) > MAX_LINES:
+        lines = lines[:MAX_LINES]
+        lines[-1] = lines[-1][:chars_per_line - 3].rstrip() + "..."
+    
+    # Join lines with newline character for FFmpeg
+    # FFmpeg drawtext uses literal newlines in the text
+    multiline_text = "\n".join(lines)
+    
+    if len(lines) > 1:
+        print(f"[Hook] Text wrapped to {len(lines)} lines:")
+        for i, line in enumerate(lines, 1):
+            print(f"       Line {i}: '{line}'")
+    
     # Escape special characters for FFmpeg drawtext
     # Order matters: escape backslashes first, then colons, then single quotes
-    escaped_text = hook_text.replace("\\", "\\\\\\\\")  # \ -> \\\\
+    escaped_text = multiline_text.replace("\\", "\\\\\\\\")  # \ -> \\\\
     escaped_text = escaped_text.replace(":", "\\:")     # : -> \:
     escaped_text = escaped_text.replace("'", "\\'")     # ' -> \'
     escaped_text = escaped_text.replace(",", "\\,")     # , -> \,  (prevent filter parsing issues)
@@ -975,7 +1047,6 @@ def generate_hook_overlay_filter(
     fade_out_end = visible_end + HOOK_FADE_OUT_DURATION
     
     # Alpha expression: fade in -> hold -> fade out
-    # Note: No quotes around expression - FFmpeg filter parser handles it
     alpha_expr = (
         f"if(lt(t\\,{fade_in_end})\\,t/{HOOK_FADE_IN_DURATION}\\,"
         f"if(lt(t\\,{visible_end})\\,1\\,"
@@ -985,15 +1056,16 @@ def generate_hook_overlay_filter(
     # Box color with opacity for the alpha animation
     box_color = f"{HOOK_BG_COLOR}@{HOOK_BG_OPACITY}"
     
-    # Drawtext filter with white box background, centered
-    # Using boxborderw for padding around text
-    # Note: No single quotes around alpha expression to avoid shell quoting issues
+    # X position: center text with safe margins
+    x_expr = f"max({HORIZONTAL_MARGIN}\\,min(w-text_w-{HORIZONTAL_MARGIN}\\,(w-text_w)/2))"
+    
+    # Drawtext filter with box background, centered with safe margins
     drawtext_filter = (
         f"drawtext=text='{escaped_text}'\\:"
         f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\\:"
         f"fontsize={HOOK_FONT_SIZE}\\:"
         f"fontcolor={HOOK_PRIMARY_COLOR}\\:"
-        f"x=(w-text_w)/2\\:"
+        f"x={x_expr}\\:"
         f"y={HOOK_POSITION_Y}\\:"
         f"alpha={alpha_expr}\\:"
         f"box=1\\:"
@@ -1259,6 +1331,244 @@ def score_segments_for_highlights(
 
     print("[Highlight] Segments scored.")
     return scored_segments
+
+
+# ==========================
+# STEP 4B: LLM-BASED CLIP SELECTION (OPENAI)
+# ==========================
+
+def detect_llm_availability() -> bool:
+    """Check if OpenAI API key is available in environment."""
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def load_prompt_template(path: str) -> str:
+    """Load the prompt template from file."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Prompt template not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def format_timestamp_simple(seconds: float) -> str:
+    """Format seconds to MM:SS or HH:MM:SS format."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def format_transcript_for_llm(segments: List[Dict]) -> str:
+    """Convert Whisper segments to timestamped transcript for LLM."""
+    lines = []
+    for seg in segments:
+        ts = format_timestamp_simple(seg["start"])
+        text = seg["text"].strip()
+        lines.append(f"[{ts}] {text}")
+    return "\n".join(lines)
+
+
+def format_prompt_for_llm(
+    segments: List[Dict],
+    prompt_template: str,
+    num_clips: int,
+    min_duration: float,
+    max_duration: float
+) -> str:
+    """
+    Format the prompt template with the actual transcript and config values.
+    """
+    # Build timestamped transcript from Whisper segments
+    transcript = format_transcript_for_llm(segments)
+    
+    # Replace placeholder with actual transcript
+    prompt = prompt_template.replace(
+        "[INSERT FULL VIDEO TRANSCRIPT HERE]",
+        transcript
+    )
+    
+    # Override clip parameters in the prompt text
+    prompt = prompt.replace(
+        "5–8 high-potential viral clips",
+        f"{num_clips} high-potential viral clips"
+    )
+    prompt = prompt.replace(
+        "30 and 60 seconds",
+        f"{int(min_duration)} and {int(max_duration)} seconds"
+    )
+    
+    return prompt
+
+
+def call_openai_for_clips(
+    prompt: str,
+    model: str = "gpt-4o-mini",
+    max_tokens: int = 4000,
+    temperature: float = 0.7
+) -> str:
+    """Call OpenAI API with the formatted prompt."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError(
+            "OpenAI package not installed. Run: pip install openai>=1.0.0"
+        )
+    
+    client = OpenAI()  # Uses OPENAI_API_KEY from environment
+    
+    print(f"[LLM] Calling OpenAI API ({model})...")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an expert short-form video editor and viral content strategist. Analyze transcripts and identify the best clips for viral potential."
+            },
+            {
+                "role": "user", 
+                "content": prompt
+            }
+        ],
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    
+    content = response.choices[0].message.content
+    print(f"[LLM] Received response ({len(content)} chars)")
+    return content
+
+
+def parse_llm_clip_response(
+    response: str,
+    segments: List[Dict],
+    min_len: float,
+    max_len: float,
+    last_word_pad: float
+) -> List[Dict]:
+    """
+    Parse the JSON block from LLM response and convert to highlight intervals.
+    """
+    import json
+    import re
+    
+    # Find JSON block in the response
+    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
+    if not json_match:
+        # Try to find raw JSON object
+        json_match = re.search(r'\{\s*"(?:niche|clips)"[\s\S]*\}', response)
+        if not json_match:
+            print("[LLM] Warning: Could not find JSON block in response")
+            return []
+    
+    json_str = json_match.group(1) if '```' in response else json_match.group(0)
+    
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        print(f"[LLM] Warning: Failed to parse JSON: {e}")
+        return []
+    
+    clips = data.get("clips", [])
+    if not clips:
+        print("[LLM] Warning: No clips found in JSON response")
+        return []
+    
+    video_duration = max((seg["end"] for seg in segments), default=0.0)
+    
+    highlight_intervals = []
+    for clip in clips:
+        start = float(clip.get("start_seconds", 0))
+        end = float(clip.get("end_seconds", 0))
+        
+        # Validate and adjust duration
+        duration = end - start
+        if duration < min_len:
+            # Extend symmetrically
+            deficit = min_len - duration
+            start = max(start - deficit / 2, 0)
+            end = min(end + deficit / 2, video_duration)
+        elif duration > max_len:
+            end = start + max_len
+        
+        # Ensure end doesn't exceed video
+        end = min(end, video_duration)
+        
+        # Extend to include last word
+        end = extend_interval_to_last_word(
+            segments, start, end, last_word_pad, video_duration
+        )
+        
+        highlight_intervals.append({
+            "start": start,
+            "end": end,
+            "score": 1.0 - (len(highlight_intervals) * 0.1),  # Order-based score
+            "text": clip.get("hook", ""),
+            "hook": clip.get("hook", ""),
+            "summary": clip.get("summary", "")
+        })
+    
+    return highlight_intervals
+
+
+def select_highlight_intervals_llm(
+    segments: List[Dict],
+    prompt_path: str,
+    num_highlights: int,
+    min_len: float,
+    max_len: float,
+    last_word_pad: float,
+    model: str = "gpt-4o-mini",
+    max_tokens: int = 4000,
+    temperature: float = 0.7
+) -> List[Dict]:
+    """
+    Use LLM to select highlight intervals instead of local scoring.
+    """
+    print(f"[LLM] Loading prompt template from '{prompt_path}'...")
+    prompt_template = load_prompt_template(prompt_path)
+    
+    prompt = format_prompt_for_llm(
+        segments,
+        prompt_template,
+        num_highlights,
+        min_len,
+        max_len
+    )
+    
+    response = call_openai_for_clips(
+        prompt,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature
+    )
+    
+    intervals = parse_llm_clip_response(
+        response,
+        segments,
+        min_len,
+        max_len,
+        last_word_pad
+    )
+    
+    # Limit to requested number
+    intervals = intervals[:num_highlights]
+    
+    if intervals:
+        print(f"[LLM] Selected {len(intervals)} interval(s):")
+        for idx, hl in enumerate(intervals, start=1):
+            print(
+                f"  #{idx}: {hl['start']:.2f}s -> {hl['end']:.2f}s "
+                f"(len={hl['end'] - hl['start']:.2f}s)"
+            )
+            if hl.get("hook"):
+                hook_display = hl["hook"][:50] + "..." if len(hl["hook"]) > 50 else hl["hook"]
+                print(f"       Hook: \"{hook_display}\"")
+    else:
+        print("[LLM] No intervals could be extracted from LLM response.")
+    
+    return intervals
 
 
 def extend_interval_to_last_word(
@@ -3027,6 +3337,10 @@ Examples:
   python video_highlight.py --hook             # Enable auto-hook overlay
   python video_highlight.py --hook --layout split  # Hook + forced split layout
   python video_highlight.py --fast             # Fast mode for quick iterations
+  python video_highlight.py --use-llm          # Use OpenAI for clip selection
+  
+Environment Variables:
+  OPENAI_API_KEY    Set this to enable LLM-based clip selection automatically
         """
     )
     
@@ -3040,6 +3354,19 @@ Examples:
         "--fast",
         action="store_true",
         help="Fast mode for development - uses ultrafast encoding and reduced analysis (5-10x faster)"
+    )
+    
+    parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Use external LLM (OpenAI) for clip identification. Auto-enabled if OPENAI_API_KEY is set."
+    )
+    
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default=None,
+        help="Override LLM model (default: gpt-4o-mini). Options: gpt-4o, gpt-4o-mini, gpt-4-turbo"
     )
     
     parser.add_argument(
@@ -3098,6 +3425,17 @@ def main():
     if args.num_clips:
         cfg.highlight.num_highlights = args.num_clips
     
+    # Check for LLM mode (explicit flag or environment variable)
+    use_llm = args.use_llm or detect_llm_availability()
+    if use_llm and detect_llm_availability():
+        cfg.llm.enabled = True
+        if args.llm_model:
+            cfg.llm.model = args.llm_model
+        print(f"[Config] LLM mode ENABLED (using {cfg.llm.model} for clip identification)")
+    elif args.use_llm and not detect_llm_availability():
+        print("[Config] WARNING: --use-llm specified but OPENAI_API_KEY not set. Falling back to local scoring.")
+        use_llm = False
+    
     # Use cfg for all references
     input_video = cfg.paths.input_video
     srt_file = cfg.paths.srt_file
@@ -3113,12 +3451,13 @@ def main():
 
     print(f"[Config] content_type='{cfg.content_type}'")
     print(f"[Config] layout.mode='{cfg.layout.mode}'")
-    print(f"[Config] Using niche-specific hooks and weights.")
+    if not cfg.llm.enabled:
+        print(f"[Config] Using niche-specific hooks and weights (local scoring).")
 
     os.makedirs(output_dir, exist_ok=True)
     video_mtime = os.path.getmtime(input_video)
 
-    # 1) Transcribe to SRT + get Whisper segments (PyTorch)
+    # 1) Transcribe to SRT + get Whisper segments (PyTorch) - always offline
     if not cfg.force_transcribe and cache_is_fresh(srt_file, video_mtime):
         print(f"[Whisper] Reusing cached transcription '{srt_file}'.")
         segments = parse_srt_to_segments(srt_file)
@@ -3136,38 +3475,57 @@ def main():
             cfg.model.whisper_size
         )
 
-    # 2) Extract audio once (for torchaudio analysis)
-    if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
-        print(f"[Audio] Reusing cached audio '{audio_wav}'.")
+    # Branch: LLM-based or local scoring for clip selection
+    if cfg.llm.enabled:
+        # LLM-based clip selection (transcription is still offline via Whisper)
+        print("[Pipeline] Using LLM for clip identification...")
+        highlight_intervals = select_highlight_intervals_llm(
+            segments=segments,
+            prompt_path=cfg.llm.prompt_template_path,
+            num_highlights=cfg.highlight.num_highlights,
+            min_len=cfg.highlight.min_length,
+            max_len=cfg.highlight.max_length,
+            last_word_pad=cfg.highlight.last_word_pad,
+            model=cfg.llm.model,
+            max_tokens=cfg.llm.max_tokens,
+            temperature=cfg.llm.temperature
+        )
     else:
-        extract_audio(input_video, audio_wav)
+        # Local scoring pipeline (original behavior)
+        print("[Pipeline] Using local scoring for clip identification...")
+        
+        # 2) Extract audio once (for torchaudio analysis)
+        if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
+            print(f"[Audio] Reusing cached audio '{audio_wav}'.")
+        else:
+            extract_audio(input_video, audio_wav)
 
-    # 3) Compute audio RMS per segment
-    rms_values = compute_rms_per_segment(audio_wav, segments)
+        # 3) Compute audio RMS per segment
+        rms_values = compute_rms_per_segment(audio_wav, segments)
 
-    # 4) Load sentiment model and score segments with niche config
-    tokenizer, sentiment_model = load_sentiment_model(cfg.model.sentiment_model)
-    scored_segments = score_segments_for_highlights(
-        segments,
-        rms_values,
-        tokenizer,
-        sentiment_model,
-        hook_keywords,
-        weights
-    )
+        # 4) Load sentiment model and score segments with niche config
+        tokenizer, sentiment_model = load_sentiment_model(cfg.model.sentiment_model)
+        scored_segments = score_segments_for_highlights(
+            segments,
+            rms_values,
+            tokenizer,
+            sentiment_model,
+            hook_keywords,
+            weights
+        )
 
-    # 5) Pick up to num_highlights viral-friendly intervals
-    highlight_intervals = select_highlight_intervals(
-        scored_segments,
-        segments,
-        num_highlights=cfg.highlight.num_highlights,
-        min_len=cfg.highlight.min_length,
-        max_len=cfg.highlight.max_length,
-        ctx_before=cfg.highlight.context_before,
-        ctx_after=cfg.highlight.context_after,
-        min_gap=cfg.highlight.min_gap,
-        last_word_pad=cfg.highlight.last_word_pad
-    )
+        # 5) Pick up to num_highlights viral-friendly intervals
+        highlight_intervals = select_highlight_intervals(
+            scored_segments,
+            segments,
+            num_highlights=cfg.highlight.num_highlights,
+            min_len=cfg.highlight.min_length,
+            max_len=cfg.highlight.max_length,
+            ctx_before=cfg.highlight.context_before,
+            ctx_after=cfg.highlight.context_after,
+            min_gap=cfg.highlight.min_gap,
+            last_word_pad=cfg.highlight.last_word_pad
+        )
 
     if not highlight_intervals:
         raise RuntimeError("No highlight intervals could be selected.")
@@ -3246,18 +3604,26 @@ def main():
         # Detect hook phrase BEFORE creating clip (so we can inline it)
         clip_hook_text = None
         if cfg.hook.enabled:
-            hook_info = detect_hook_phrase(
-                segments,
-                clip_start,
-                clip_end,
-                hook_keywords
-            )
-            if hook_info:
-                clip_hook_text = hook_info["text"]
+            # Priority 1: Use LLM-generated hook if available (from LLM mode)
+            llm_hook = interval.get("hook", "").strip()
+            if llm_hook:
+                clip_hook_text = llm_hook
                 display_text = f'"{clip_hook_text[:50]}..."' if len(clip_hook_text) > 50 else f'"{clip_hook_text}"'
-                print(f"[Hook] Detected hook for clip {idx+1}: {display_text}")
+                print(f"[Hook] Using LLM-generated hook for clip {idx+1}: {display_text}")
             else:
-                print(f"[Hook] No suitable hook phrase found for clip {idx+1}")
+                # Priority 2: Detect hook locally from transcript
+                hook_info = detect_hook_phrase(
+                    segments,
+                    clip_start,
+                    clip_end,
+                    hook_keywords
+                )
+                if hook_info:
+                    clip_hook_text = hook_info["text"]
+                    display_text = f'"{clip_hook_text[:50]}..."' if len(clip_hook_text) > 50 else f'"{clip_hook_text}"'
+                    print(f"[Hook] Detected hook for clip {idx+1}: {display_text}")
+                else:
+                    print(f"[Hook] No suitable hook phrase found for clip {idx+1}")
         
         # Create clip with appropriate layout (hook inlined in single pass)
         if effective_layout != "single" and layout_segments:

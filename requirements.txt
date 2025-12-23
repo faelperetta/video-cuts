@@ -5,3 +5,4 @@ transformers
 mediapipe
 opencv-python
 yt-dlp
+openai>=1.0.0
