@@ -57,7 +57,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 45.0          # seconds
+    max_length: float = 60.0          # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 3           # how many clips to export
@@ -156,6 +156,7 @@ class LayoutConfig:
 class ModelConfig:
     """Model paths and settings."""
     whisper_size: str = "small"
+    whisper_language: Optional[str] = None  # None = auto-detect, or ISO 639-1 code (e.g., 'pt', 'en')
     sentiment_model: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"
     face_detector_url: str = (
         "https://storage.googleapis.com/mediapipe-models/face_detection/"
@@ -183,7 +184,7 @@ class PathConfig:
     """File paths and directories."""
     input_video: str = "input.webm"
     srt_file: str = "subs.srt"
-    audio_wav: str = "audio.wav"
+    audio_wav: str = "audio.mp3"
     output_dir: str = "clips_output"
     final_output: str = "final_highlight.mp4"
     
@@ -979,11 +980,11 @@ def generate_hook_overlay_filter(
     HORIZONTAL_MARGIN = 50
     MAX_LINES = 3  # Maximum number of lines for the hook
     
-    # Estimate max characters per line
-    # DejaVuSans-Bold at font size 52 averages about 27px per character
+    # Estimate max characters per line - be more conservative to avoid overflow
+    # Use 0.6 multiplier for better character width estimation (accounts for accents, wide chars)
     usable_width = target_w - (2 * HORIZONTAL_MARGIN) - (2 * HOOK_BOX_PADDING)
-    avg_char_width = HOOK_FONT_SIZE * 0.52
-    chars_per_line = int(usable_width / avg_char_width)
+    avg_char_width = HOOK_FONT_SIZE * 0.6  # More conservative estimate
+    chars_per_line = max(10, int(usable_width / avg_char_width) - 2)  # Subtract 2 for safety margin
     
     # Word-wrap the text into multiple lines
     display_text = hook_text.strip()
@@ -1056,8 +1057,11 @@ def generate_hook_overlay_filter(
     # Box color with opacity for the alpha animation
     box_color = f"{HOOK_BG_COLOR}@{HOOK_BG_OPACITY}"
     
-    # X position: center text with safe margins
-    x_expr = f"max({HORIZONTAL_MARGIN}\\,min(w-text_w-{HORIZONTAL_MARGIN}\\,(w-text_w)/2))"
+    # X position: center text but ensure it stays on screen
+    # If text is too wide, clamp to left margin (text will be left-aligned)
+    # Formula: max(margin, min(w - text_w - margin, (w - text_w) / 2))
+    # Simplified: always center, but clamp to at least the margin
+    x_expr = f"max({HORIZONTAL_MARGIN}\\,(w-text_w)/2)"
     
     # Drawtext filter with box background, centered with safe margins
     drawtext_filter = (
@@ -1110,19 +1114,46 @@ def apply_hook_overlay(
 def transcribe_to_srt_and_segments(
     input_video: str,
     srt_path: str,
-    model_size: str = "small"
-) -> List[Dict]:
+    model_size: str = "small",
+    language: Optional[str] = None
+) -> Tuple[List[Dict], str]:
     """
     Use Whisper (PyTorch) to transcribe `input_video`, write an SRT file,
-    and return the list of segments with word-level timestamps.
+    and return the list of segments with word-level timestamps plus detected language.
+    
+    Whisper automatically detects the video language and transcribes in that language,
+    unless a specific language is provided.
+    
+    Args:
+        input_video: Path to the video file
+        srt_path: Output path for the SRT file
+        model_size: Whisper model size (tiny, base, small, medium, large)
+        language: Optional ISO 639-1 language code (e.g., 'pt', 'en', 'es'). 
+                  If None, Whisper auto-detects the language.
+    
+    Returns:
+        Tuple of (segments, language_code) where language_code is ISO 639-1 (e.g., "en", "es", "pt")
     """
     print(f"[Whisper] Loading model '{model_size}'...")
     model = whisper.load_model(model_size)
 
+    if language:
+        print(f"[Whisper] Using specified language: '{language}'")
+    else:
+        print(f"[Whisper] Auto-detecting language...")
+    
     print(f"[Whisper] Transcribing '{input_video}' with word timestamps...")
-    result = model.transcribe(input_video, task="transcribe", word_timestamps=True)
+    result = model.transcribe(
+        input_video, 
+        task="transcribe", 
+        word_timestamps=True, 
+        language=language  # None = auto-detect, or use specified language
+    )
 
     segments = result["segments"]
+    detected_language = result.get("language", language or "en")
+    
+    print(f"[Whisper] Detected language: '{detected_language}'")
 
     print(f"[Whisper] Writing SRT to '{srt_path}'...")
     with open(srt_path, "w", encoding="utf-8") as f:
@@ -1136,7 +1167,7 @@ def transcribe_to_srt_and_segments(
             f.write(f"{text}\n\n")
 
     print("[Whisper] Done transcription.")
-    return segments
+    return segments, detected_language
 
 
 # ==========================
@@ -1145,13 +1176,16 @@ def transcribe_to_srt_and_segments(
 
 def extract_audio(input_video: str, audio_path: str) -> None:
     """
-    Extract audio from the input video to a WAV file.
+    Extract audio from the input video to an MP3 file.
+    Uses 64kbps mono for ~90% size reduction vs WAV while preserving
+    sufficient quality for RMS energy analysis.
     """
     cmd = [
         "ffmpeg", "-y",
         "-i", input_video,
         "-vn",                # no video
-        "-acodec", "pcm_s16le",
+        "-acodec", "libmp3lame",
+        "-b:a", "64k",        # 64kbps (sufficient for RMS analysis)
         "-ar", "16000",       # 16kHz
         "-ac", "1",           # mono
         audio_path
@@ -2453,12 +2487,16 @@ def determine_layout_segments(
     - faces: list of face info (for split/wide modes)
     - active_track: track_id of active speaker (for single mode)
     """
-    if not samples or LAYOUT_MODE == "single":
+    # Use cfg.layout.mode instead of global LAYOUT_MODE to respect CLI overrides
+    layout_mode = cfg.layout.mode
+    
+    if not samples or layout_mode == "single":
         return [{"start": clip_start, "end": clip_end, "layout": "single", "active_track": None}]
     
-    if LAYOUT_MODE in ("split", "wide"):
-        # Force specific layout
-        return [{"start": clip_start, "end": clip_end, "layout": LAYOUT_MODE, "faces": []}]
+    if layout_mode in ("split", "wide"):
+        # Force specific layout for the entire clip
+        print(f"[Layout] Forcing {layout_mode.upper()} layout for entire clip")
+        return [{"start": clip_start, "end": clip_end, "layout": layout_mode, "faces": []}]
     
     # Auto mode: analyze face positions and activity
     layout_samples = []
@@ -3397,6 +3435,13 @@ Environment Variables:
         help="Number of highlight clips to generate"
     )
     
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Override language detection (e.g., 'pt' for Portuguese, 'en' for English, 'es' for Spanish)"
+    )
+    
     return parser.parse_args()
 
 
@@ -3424,6 +3469,10 @@ def main():
         
     if args.num_clips:
         cfg.highlight.num_highlights = args.num_clips
+    
+    if args.language:
+        cfg.model.whisper_language = args.language
+        print(f"[Config] Language override: '{args.language}'")
     
     # Check for LLM mode (explicit flag or environment variable)
     use_llm = args.use_llm or detect_llm_availability()
@@ -3458,22 +3507,39 @@ def main():
     video_mtime = os.path.getmtime(input_video)
 
     # 1) Transcribe to SRT + get Whisper segments (PyTorch) - always offline
+    # Whisper auto-detects the video language and transcribes in that language
+    import time as _time
+    transcription_start = _time.time()
+    detected_language = "en"  # Default fallback
+    
     if not cfg.force_transcribe and cache_is_fresh(srt_file, video_mtime):
         print(f"[Whisper] Reusing cached transcription '{srt_file}'.")
         segments = parse_srt_to_segments(srt_file)
         if not segments:
             print("[Whisper] Cached SRT could not be parsed, re-transcribing...")
-            segments = transcribe_to_srt_and_segments(
+            segments, detected_language = transcribe_to_srt_and_segments(
                 input_video,
                 srt_file,
-                cfg.model.whisper_size
+                cfg.model.whisper_size,
+                cfg.model.whisper_language
             )
     else:
-        segments = transcribe_to_srt_and_segments(
+        segments, detected_language = transcribe_to_srt_and_segments(
             input_video,
             srt_file,
-            cfg.model.whisper_size
+            cfg.model.whisper_size,
+            cfg.model.whisper_language
         )
+    
+    transcription_elapsed = _time.time() - transcription_start
+    print(f"[Whisper] Transcription completed in {transcription_elapsed:.2f}s")
+    print(f"[Whisper] Video language: '{detected_language}'")
+
+    # 2) Extract audio once (always cached for potential future use)
+    if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
+        print(f"[Audio] Reusing cached audio '{audio_wav}'.")
+    else:
+        extract_audio(input_video, audio_wav)
 
     # Branch: LLM-based or local scoring for clip selection
     if cfg.llm.enabled:
@@ -3493,12 +3559,6 @@ def main():
     else:
         # Local scoring pipeline (original behavior)
         print("[Pipeline] Using local scoring for clip identification...")
-        
-        # 2) Extract audio once (for torchaudio analysis)
-        if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
-            print(f"[Audio] Reusing cached audio '{audio_wav}'.")
-        else:
-            extract_audio(input_video, audio_wav)
 
         # 3) Compute audio RMS per segment
         rms_values = compute_rms_per_segment(audio_wav, segments)
