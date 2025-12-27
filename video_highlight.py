@@ -15,6 +15,17 @@ from contextlib import nullcontext
 import torch
 import torchaudio
 import whisper
+import warnings
+# ==========================
+# DEVICE SELECTION (CUDA/CPU)
+# ==========================
+
+TORCH_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    print("[Torch] CUDA is available. Using GPU for processing.")
+else:
+    print("[Torch] CUDA not available. Using CPU for processing.")
+
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 try:
@@ -57,7 +68,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 60.0          # seconds
+    max_length: float = 80.0          # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 3           # how many clips to export
@@ -104,7 +115,8 @@ class LipDetectionConfig:
 @dataclass
 class CaptionConfig:
     """Animated caption style configuration."""
-    font_name: str = "Arial"
+    font_name: str = "Montserrat"
+    font_path: str = ""                  # Path to font file (optional, auto-detected if empty)
     font_size: int = 58
     primary_color: str = "&H00FFFFFF"    # White (AABBGGRR format)
     highlight_color: str = "&H0000FF00"  # Bright green for current word
@@ -124,18 +136,19 @@ class HookConfig:
     scan_seconds: float = 5.0         # Seconds at start to scan for hook
     min_words: int = 3
     max_words: int = 12               # Allow slightly longer hooks
-    font_name: str = "Arial"
+    font_name: str = "Montserrat"
+    font_path: str = ""               # Path to font file (auto-detected if empty)
     font_size: int = 52               # Larger font for better visibility
     primary_color: str = "black"      # Hook text color (FFmpeg format)
-    bg_color: str = "yellow"          # Yellow background - stands out more
+    bg_color: str = "white"           # White background for hook
     bg_opacity: float = 0.98          # Nearly opaque for better readability
     position_y: int = 100             # Slightly higher position
     fade_in: float = 0.4              # Slightly longer fade-in
     display_duration: float = 4.0     # Longer display time (4 seconds)
     fade_out: float = 0.5             # Slightly longer fade-out
     box_padding: int = 28             # More padding around text
-    box_border_w: int = 32            # Larger border
-    shadow_color: str = "black@0.5"   # Stronger shadow for depth
+    box_border_w: int = 8             # Softer border (simulate rounded)
+    shadow_color: str = "#00000000"   # No shadow (fully transparent)
 
 
 @dataclass
@@ -293,6 +306,7 @@ LIP_SPEAKING_THRESHOLD = cfg.lip_detection.speaking_threshold
 
 # Caption style (access via cfg.caption for new code)
 CAPTION_FONT_NAME = cfg.caption.font_name
+CAPTION_FONT_PATH = cfg.caption.font_path
 CAPTION_FONT_SIZE = cfg.caption.font_size
 CAPTION_PRIMARY_COLOR = cfg.caption.primary_color
 CAPTION_HIGHLIGHT_COLOR = cfg.caption.highlight_color
@@ -310,6 +324,7 @@ HOOK_SCAN_SECONDS = cfg.hook.scan_seconds
 HOOK_MIN_WORDS = cfg.hook.min_words
 HOOK_MAX_WORDS = cfg.hook.max_words
 HOOK_FONT_NAME = cfg.hook.font_name
+HOOK_FONT_PATH = cfg.hook.font_path
 HOOK_FONT_SIZE = cfg.hook.font_size
 HOOK_PRIMARY_COLOR = cfg.hook.primary_color
 HOOK_BG_COLOR = cfg.hook.bg_color
@@ -460,6 +475,157 @@ def get_niche_config(content_type: str):
 # ==========================
 # UTILS
 # ==========================
+
+# Default fallback font paths (system fonts that are commonly available)
+FALLBACK_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",  # macOS
+]
+
+
+def find_font_path(font_name: str, bold: bool = True) -> Optional[str]:
+    """
+    Search for a font file on the system by font name.
+    
+    Uses fc-match (fontconfig) to find the best matching font file.
+    Falls back to common system font locations if fc-match is unavailable.
+    
+    Args:
+        font_name: Name of the font (e.g., "Montserrat", "Arial")
+        bold: Whether to prefer bold variant
+        
+    Returns:
+        Path to font file, or None if not found
+    """
+    # Build the font pattern for fc-match
+    pattern = font_name
+    if bold:
+        pattern += ":weight=bold"
+    
+    try:
+        # Use fc-match to find the font file
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            font_path = result.stdout.strip()
+            if os.path.isfile(font_path):
+                return font_path
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    # Fallback: search common font directories
+    font_dirs = [
+        "/usr/share/fonts/truetype/",
+        "/usr/share/fonts/TTF/",
+        "/usr/local/share/fonts/",
+        os.path.expanduser("~/.fonts/"),
+        os.path.expanduser("~/.local/share/fonts/"),
+    ]
+    
+    # Build possible filenames
+    suffix = "-Bold" if bold else "-Regular"
+    possible_names = [
+        f"{font_name}{suffix}.ttf",
+        f"{font_name}{suffix}.otf",
+        f"{font_name.replace(' ', '')}{suffix}.ttf",
+        f"{font_name.replace(' ', '')}{suffix}.otf",
+        f"{font_name.lower()}{suffix.lower()}.ttf",
+        f"{font_name.lower()}{suffix.lower()}.otf",
+    ]
+    
+    for font_dir in font_dirs:
+        if not os.path.isdir(font_dir):
+            continue
+        for root, _, files in os.walk(font_dir):
+            for filename in files:
+                if filename in possible_names or filename.lower() in [n.lower() for n in possible_names]:
+                    return os.path.join(root, filename)
+    
+    return None
+
+
+def get_font_path_with_fallback(font_name: str, font_path: str = "", bold: bool = True) -> str:
+    """
+    Get a usable font path, with automatic detection and fallback.
+    
+    Args:
+        font_name: Name of the preferred font
+        font_path: Explicit path to font file (if provided, used directly)
+        bold: Whether to prefer bold variant
+        
+    Returns:
+        Path to a usable font file
+    """
+    # If explicit path provided and exists, use it
+    if font_path and os.path.isfile(font_path):
+        return font_path
+    
+    # Try to find the font by name
+    found_path = find_font_path(font_name, bold)
+    if found_path:
+        return found_path
+    
+    # Fallback to system fonts
+    for fallback in FALLBACK_FONT_PATHS:
+        if os.path.isfile(fallback):
+            print(f"[Font] Warning: '{font_name}' not found, using fallback: {fallback}")
+            return fallback
+    
+    # Last resort - return the font name and hope FFmpeg can resolve it
+    print(f"[Font] Warning: No font file found for '{font_name}', FFmpeg may fail")
+    return font_name
+
+
+def verify_font_available(font_name: str, font_path: str = "") -> bool:
+    """
+    Verify that a font is available for rendering.
+    
+    Args:
+        font_name: Name of the font to check
+        font_path: Explicit path to font file
+        
+    Returns:
+        True if font is available, False otherwise
+    """
+    # Check explicit path
+    if font_path and os.path.isfile(font_path):
+        return True
+    
+    # Check via fc-list
+    try:
+        result = subprocess.run(
+            ["fc-list", f":family={font_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    # Try to find font file
+    return find_font_path(font_name) is not None
+
+
+def print_font_installation_guide(font_name: str) -> None:
+    """Print instructions for installing a missing font."""
+    print(f"\n[Font] '{font_name}' font not found on your system.")
+    print("To install Montserrat font:")
+    print("  Ubuntu/Debian: sudo apt install fonts-montserrat")
+    print("  Fedora: sudo dnf install google-montserrat-fonts")
+    print("  Arch: sudo pacman -S ttf-montserrat")
+    print("  Manual: Download from https://fonts.google.com/specimen/Montserrat")
+    print("          Extract and copy .ttf files to ~/.local/share/fonts/")
+    print("          Run: fc-cache -f -v")
+    print("")
+
 
 def format_timestamp(t: float) -> str:
     """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
@@ -1063,10 +1229,16 @@ def generate_hook_overlay_filter(
     # Simplified: always center, but clamp to at least the margin
     x_expr = f"max({HORIZONTAL_MARGIN}\\,(w-text_w)/2)"
     
+    # Get font path with fallback
+    font_file = get_font_path_with_fallback(HOOK_FONT_NAME, HOOK_FONT_PATH, bold=True)
+    # Escape colons in font path for FFmpeg filter syntax
+    font_file_escaped = font_file.replace(":", "\\:")
+    
     # Drawtext filter with box background, centered with safe margins
+    # Note: FFmpeg drawtext does not support true rounded corners, but a lower boxborderw simulates a softer look.
     drawtext_filter = (
         f"drawtext=text='{escaped_text}'\\:"
-        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf\\:"
+        f"fontfile={font_file_escaped}\\:"
         f"fontsize={HOOK_FONT_SIZE}\\:"
         f"fontcolor={HOOK_PRIMARY_COLOR}\\:"
         f"x={x_expr}\\:"
@@ -1074,9 +1246,9 @@ def generate_hook_overlay_filter(
         f"alpha={alpha_expr}\\:"
         f"box=1\\:"
         f"boxcolor={box_color}\\:"
-        f"boxborderw={HOOK_BOX_PADDING}\\:"
+        f"boxborderw={HOOK_BOX_BORDER_W}\\:"
         f"shadowcolor={HOOK_SHADOW_COLOR}\\:"
-        f"shadowx=2\\:shadowy=2"
+        f"shadowx=0\\:shadowy=0"
     )
     
     return drawtext_filter
@@ -1134,8 +1306,8 @@ def transcribe_to_srt_and_segments(
     Returns:
         Tuple of (segments, language_code) where language_code is ISO 639-1 (e.g., "en", "es", "pt")
     """
-    print(f"[Whisper] Loading model '{model_size}'...")
-    model = whisper.load_model(model_size)
+    print(f"[Whisper] Loading model '{model_size}' on device '{TORCH_DEVICE}'...")
+    model = whisper.load_model(model_size, device=str(TORCH_DEVICE))
 
     if language:
         print(f"[Whisper] Using specified language: '{language}'")
@@ -1233,6 +1405,10 @@ def load_sentiment_model(model_name: str):
     print(f"[NLP] Loading sentiment model '{model_name}'...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    try:
+        model = model.to(TORCH_DEVICE)
+    except Exception as e:
+        warnings.warn(f"Could not move model to device {TORCH_DEVICE}: {e}")
     model.eval()
     return tokenizer, model
 
@@ -1255,6 +1431,9 @@ def sentiment_intensity(
         truncation=True,
         max_length=128
     )
+    # Move tensors to the correct device
+    for k in inputs:
+        inputs[k] = inputs[k].to(TORCH_DEVICE)
 
     with torch.no_grad():
         logits = model(**inputs).logits
@@ -3490,6 +3669,25 @@ def main():
     srt_file = cfg.paths.srt_file
     audio_wav = cfg.paths.audio_wav
     output_dir = cfg.paths.output_dir
+    
+    # Verify fonts are available
+    print("[Font] Checking font availability...")
+    caption_font_ok = verify_font_available(cfg.caption.font_name, cfg.caption.font_path)
+    hook_font_ok = verify_font_available(cfg.hook.font_name, cfg.hook.font_path)
+    
+    if caption_font_ok:
+        print(f"[Font] Caption font '{cfg.caption.font_name}' - OK")
+    else:
+        print(f"[Font] Caption font '{cfg.caption.font_name}' - NOT FOUND (will use fallback)")
+        print_font_installation_guide(cfg.caption.font_name)
+    
+    if hook_font_ok:
+        hook_font_path = get_font_path_with_fallback(cfg.hook.font_name, cfg.hook.font_path, bold=True)
+        print(f"[Font] Hook font '{cfg.hook.font_name}' - OK ({hook_font_path})")
+    else:
+        print(f"[Font] Hook font '{cfg.hook.font_name}' - NOT FOUND (will use fallback)")
+        if cfg.caption.font_name != cfg.hook.font_name:
+            print_font_installation_guide(cfg.hook.font_name)
     
     if not os.path.exists(input_video):
         raise FileNotFoundError(f"Input video not found: {input_video}")

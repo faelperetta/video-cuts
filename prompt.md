@@ -27,7 +27,8 @@ The transcript includes timestamps in the format [MM:SS] or [HH:MM:SS] at the be
    - **Viral Elements**: List the specific elements that make this clip likely to go viral (e.g., "High emotional relatability", "Quick actionable value", "Contrarian take", "Storytelling arc with payoff", "Shock value", "Humor", "Inspirational moment").
    - **Suggested Editing Style**: Professional recommendations for making the clip feel premium and engaging (e.g., "Fast-paced cuts synced to music beats", "Bold text overlays with key quotes", "Zoom-in on speaker during emotional peak", "B-roll suggestions if applicable", "Upbeat royalty-free background music", "Color grade for energy").
 
-   **When selecting start and end points**, always prioritize natural conversational breaks (end of a thought, answer to a question, completion of a story beat, or punchline delivery). Never cut mid-sentence or mid-idea unless absolutely necessary for timing. The clip must feel complete and satisfying when watched alone, with a clear beginning, middle, and end.
+   - **When selecting start and end points**, always prioritize natural conversational breaks (end of a thought, answer to a question, completion of a story beat, or punchline delivery). Never cut mid-sentence or mid-idea unless absolutely necessary for timing. The clip must feel complete and satisfying when watched alone, with a clear beginning, middle, and end.
+   **Remember**: The clip must feel complete and satisfying when watched alone, with a clear beginning, middle, and end. Always double check it. If you need more time to complete the thought/answer, you can add 10% more time than the threshold.
 
 **Prioritize clips that contain:**
 - Strong emotional moments or stories
