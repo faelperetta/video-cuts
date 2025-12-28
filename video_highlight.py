@@ -68,7 +68,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 80.0          # seconds
+    max_length: float = 90.0          # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 3           # how many clips to export
@@ -84,7 +84,8 @@ class FaceTrackingConfig:
     track_distance: float = 0.12      # max normalized horizontal delta for same track
     track_max_gap: float = 1.0        # seconds before track is recycled
     activity_threshold: float = 0.0035  # threshold for choosing active speaker
-    recenter_after: float = 0.35      # seconds without detection before easing to center
+    recenter_after: float = 1.5       # seconds without detection before easing to center (was 0.35)
+    min_face_width: float = 0.08      # minimum face width (normalized) to consider - filters background faces
 
 
 @dataclass
@@ -1583,32 +1584,25 @@ def format_transcript_for_llm(segments: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def format_prompt_for_llm(
-    segments: List[Dict],
+def build_system_prompt(
     prompt_template: str,
     num_clips: int,
     min_duration: float,
     max_duration: float
 ) -> str:
     """
-    Format the prompt template with the actual transcript and config values.
+    Build the system prompt from template with config values.
+    
+    The transcript is NOT included here - it will be sent separately
+    as the user message for better AI understanding.
     """
-    # Build timestamped transcript from Whisper segments
-    transcript = format_transcript_for_llm(segments)
-    
-    # Replace placeholder with actual transcript
-    prompt = prompt_template.replace(
-        "[INSERT FULL VIDEO TRANSCRIPT HERE]",
-        transcript
-    )
-    
     # Override clip parameters in the prompt text
-    prompt = prompt.replace(
+    prompt = prompt_template.replace(
         "5–8 high-potential viral clips",
         f"{num_clips} high-potential viral clips"
     )
     prompt = prompt.replace(
-        "30 and 60 seconds",
+        "15 and 90 seconds",
         f"{int(min_duration)} and {int(max_duration)} seconds"
     )
     
@@ -1616,12 +1610,25 @@ def format_prompt_for_llm(
 
 
 def call_openai_for_clips(
-    prompt: str,
+    system_prompt: str,
+    transcript: str,
     model: str = "gpt-4o-mini",
     max_tokens: int = 4000,
     temperature: float = 0.7
 ) -> str:
-    """Call OpenAI API with the formatted prompt."""
+    """
+    Call OpenAI API with system/user message structure.
+    
+    Args:
+        system_prompt: The instructions from prompt.md (what the AI should do)
+        transcript: The video transcript to analyze (what data to process)
+        model: OpenAI model to use
+        max_tokens: Maximum tokens in response
+        temperature: Sampling temperature
+    
+    Returns:
+        The LLM response text containing clip recommendations
+    """
     try:
         from openai import OpenAI
     except ImportError:
@@ -1632,16 +1639,18 @@ def call_openai_for_clips(
     client = OpenAI()  # Uses OPENAI_API_KEY from environment
     
     print(f"[LLM] Calling OpenAI API ({model})...")
+    print(f"[LLM] System prompt: {len(system_prompt)} chars, Transcript: {len(transcript)} chars")
+    
     response = client.chat.completions.create(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert short-form video editor and viral content strategist. Analyze transcripts and identify the best clips for viral potential."
+                "content": system_prompt
             },
             {
-                "role": "user", 
-                "content": prompt
+                "role": "user",
+                "content": f"Analyze this video transcript and extract the best viral clips:\n\n{transcript}"
             }
         ],
         max_tokens=max_tokens,
@@ -1719,7 +1728,9 @@ def parse_llm_clip_response(
             "score": 1.0 - (len(highlight_intervals) * 0.1),  # Order-based score
             "text": clip.get("hook", ""),
             "hook": clip.get("hook", ""),
-            "summary": clip.get("summary", "")
+            "summary": clip.get("summary", ""),
+            "idea_completion": clip.get("idea_completion", None),
+            "hashtags": clip.get("hashtags", None)
         })
     
     return highlight_intervals
@@ -1738,20 +1749,28 @@ def select_highlight_intervals_llm(
 ) -> List[Dict]:
     """
     Use LLM to select highlight intervals instead of local scoring.
+    
+    Uses a system/user message structure:
+    - System: Instructions from prompt.md
+    - User: The actual video transcript
     """
     print(f"[LLM] Loading prompt template from '{prompt_path}'...")
     prompt_template = load_prompt_template(prompt_path)
     
-    prompt = format_prompt_for_llm(
-        segments,
+    # Build system prompt (instructions only, no transcript)
+    system_prompt = build_system_prompt(
         prompt_template,
         num_highlights,
         min_len,
         max_len
     )
     
+    # Format transcript for user message
+    transcript = format_transcript_for_llm(segments)
+    
     response = call_openai_for_clips(
-        prompt,
+        system_prompt=system_prompt,
+        transcript=transcript,
         model=model,
         max_tokens=max_tokens,
         temperature=temperature
@@ -2300,6 +2319,10 @@ def analyze_clip_faces(
             else:
                 detections = _detect_faces_with_cascade(cascade, frame)
 
+            # Filter out small faces (likely background people or false positives)
+            min_face_width = cfg.face_tracking.min_face_width
+            detections = [d for d in detections if d.get("width", 0.1) >= min_face_width]
+
             # Process each detection
             frame_faces = []
             assigned_entries = []
@@ -2397,7 +2420,11 @@ def analyze_clip_faces(
                         best_other_score = -1.0
                         for entry in assigned_entries:
                             tid = entry.get("track_id")
-                            score = track_lip_activity.get(tid, 0.0)
+                            # Score = lip activity + face size bonus (larger faces prioritized)
+                            lip_score = track_lip_activity.get(tid, 0.0)
+                            face_width = entry.get("width", 0.1)
+                            size_bonus = face_width * 0.1  # Larger faces get higher priority
+                            score = lip_score + size_bonus
                             if score > best_other_score:
                                 best_other_score = score
                                 best_other_entry = entry
@@ -2419,7 +2446,15 @@ def analyze_clip_faces(
                         lock_start_time = ts
                         track_lip_activity = {locked_track_id: track_lip_activity.get(locked_track_id, 0.0)}
                     else:
-                        active_entry = locked_entry if locked_entry else max(assigned_entries, key=lambda d: track_lip_activity.get(d.get("track_id"), 0.0))
+                        if locked_entry:
+                            active_entry = locked_entry
+                        else:
+                            # Fallback: select by lip activity + face size bonus
+                            def get_score(d):
+                                lip = track_lip_activity.get(d.get("track_id"), 0.0)
+                                size = d.get("width", 0.1) * 0.1
+                                return lip + size
+                            active_entry = max(assigned_entries, key=get_score)
 
             # Build speaker sample
             if active_entry is None:
@@ -2625,26 +2660,54 @@ def crop_x_expression_for_segments(
     target_w: int
 ) -> Optional[str]:
     if not segments:
+        print("[CropExpr] Warning: No segments provided, using center crop")
         return None
 
     duration = clip_end - clip_start
     base_expr = f"(in_w-{target_w})/2"
 
-    expr = base_expr
-    for seg in reversed(segments):
+    # Validate segments cover the clip duration
+    valid_segments = []
+    for seg in segments:
         rel_start = max(seg["start"] - clip_start, 0.0)
         rel_end = min(seg["end"] - clip_start, duration)
-        if rel_end <= rel_start:
-            continue
+        if rel_end > rel_start:
+            valid_segments.append({
+                "rel_start": rel_start,
+                "rel_end": rel_end,
+                "center": seg["center"]
+            })
+    
+    if not valid_segments:
+        print("[CropExpr] Warning: No valid segments after filtering, using center crop")
+        return None
+    
+    # Log segment coverage for debugging
+    total_coverage = sum(s["rel_end"] - s["rel_start"] for s in valid_segments)
+    coverage_pct = (total_coverage / duration) * 100 if duration > 0 else 0
+    avg_center = sum(s["center"] for s in valid_segments) / len(valid_segments)
+    print(f"[CropExpr] Building expression: {len(valid_segments)} segments, "
+          f"coverage={coverage_pct:.1f}%, avg_center={avg_center:.3f}")
+    
+    # Check for gaps in coverage
+    sorted_segs = sorted(valid_segments, key=lambda s: s["rel_start"])
+    if sorted_segs[0]["rel_start"] > 0.1:
+        print(f"[CropExpr] Warning: Gap at start (0 to {sorted_segs[0]['rel_start']:.2f}s)")
+    if sorted_segs[-1]["rel_end"] < duration - 0.1:
+        print(f"[CropExpr] Warning: Gap at end ({sorted_segs[-1]['rel_end']:.2f}s to {duration:.2f}s)")
+
+    expr = base_expr
+    for seg in reversed(valid_segments):
         center_expr = (
             f"clip(({seg['center']:.4f})*in_w-{target_w}/2,0,in_w-{target_w})"
         )
         expr = (
-            f"if(between(t,{rel_start:.3f},{rel_end:.3f}),"
+            f"if(between(t,{seg['rel_start']:.3f},{seg['rel_end']:.3f}),"
             f"{center_expr},{expr})"
         )
 
     return expr
+
 
 
 # ==========================
@@ -3923,9 +3986,23 @@ def main():
 
         generated_outputs.append(output_path)
 
-    print("\n[Done] Generated highlight videos:")
-    for path in generated_outputs:
-        print(f" - {path}")
+    print("\n[Done] Generated highlight videos and metadata:")
+    for idx, (path, interval) in enumerate(zip(generated_outputs, highlight_intervals)):
+        print(f"\nClip {idx+1}:")
+        print(f"  Video file: {os.path.basename(path)}")
+        title = interval.get('hook', '') or interval.get('text', '')
+        print(f"  Title: {title}")
+        summary = interval.get('summary', '')
+        if summary:
+            print(f"  Summary: {summary}")
+        hashtags = interval.get('hashtags', '')
+        if hashtags:
+            print(f"  Hashtags: {hashtags}")
+        idea_completion = interval.get('idea_completion', None)
+        if idea_completion is not None:
+            print(f"  Idea Completion: {idea_completion}")
+        else:
+            print(f"  Idea Completion: (not provided)")
 
 
 if __name__ == "__main__":
