@@ -1722,10 +1722,14 @@ def parse_llm_clip_response(
             segments, start, end, last_word_pad, video_duration
         )
         
+        # Extract viral score with fallback
+        viral_score = float(clip.get("viral_score", 5.0))
+        
         highlight_intervals.append({
             "start": start,
             "end": end,
-            "score": 1.0 - (len(highlight_intervals) * 0.1),  # Order-based score
+            "score": viral_score,  # Use viral_score directly
+            "viral_score": viral_score, # Keep specific field too
             "text": clip.get("hook", ""),
             "hook": clip.get("hook", ""),
             "summary": clip.get("summary", ""),
@@ -1735,6 +1739,43 @@ def parse_llm_clip_response(
     
     return highlight_intervals
 
+
+def split_transcript_into_parts(segments: List[Dict], num_parts: int = 3) -> List[Tuple[str, str]]:
+    """
+    Split segments into overlapping parts to ensure full coverage.
+    Returns list of (part_name, formatted_transcript).
+    
+    Part 1: 0% - 35%
+    Part 2: 30% - 68%
+    Part 3: 63% - 100%
+    """
+    if not segments:
+        return []
+        
+    duration = segments[-1]["end"]
+    parts = []
+    
+    # Define overlaps (start_ratio, end_ratio)
+    ranges = [
+        (0.0, 0.35),
+        (0.30, 0.68),
+        (0.63, 1.0)
+    ]
+    
+    for i, (start_r, end_r) in enumerate(ranges):
+        t_start = duration * start_r
+        t_end = duration * end_r
+        
+        part_segments = [
+            s for s in segments 
+            if s["start"] >= t_start and s["end"] <= t_end
+        ]
+        
+        if part_segments:
+            transcript = format_transcript_for_llm(part_segments)
+            parts.append((f"Part {i+1}/{len(ranges)}", transcript))
+            
+    return parts
 
 def select_highlight_intervals_llm(
     segments: List[Dict],
@@ -1748,59 +1789,100 @@ def select_highlight_intervals_llm(
     temperature: float = 0.7
 ) -> List[Dict]:
     """
-    Use LLM to select highlight intervals instead of local scoring.
-    
-    Uses a system/user message structure:
-    - System: Instructions from prompt.md
-    - User: The actual video transcript
+    Multi-pass LLM selection strategy:
+    1. Split video into 3 overlapping parts
+    2. Ask LLM to find ALL viral clips in each part
+    3. Aggregate all candidates
+    4. Rank by viral_score (descending)
+    5. Select top N unique clips
     """
     print(f"[LLM] Loading prompt template from '{prompt_path}'...")
     prompt_template = load_prompt_template(prompt_path)
     
-    # Build system prompt (instructions only, no transcript)
+    # Use "Full Discovery" mode - ask for more candidates per chunk
     system_prompt = build_system_prompt(
         prompt_template,
-        num_highlights,
-        min_len,
-        max_len
+        num_clips=20, # Ask for many candidates per chunk
+        min_duration=min_len,
+        max_duration=max_len
     )
     
-    # Format transcript for user message
-    transcript = format_transcript_for_llm(segments)
+    # Split transcript
+    parts = split_transcript_into_parts(segments)
+    all_candidates = []
     
-    response = call_openai_for_clips(
-        system_prompt=system_prompt,
-        transcript=transcript,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature
-    )
+    print(f"[LLM] Starting multi-pass analysis ({len(parts)} parts)...")
     
-    intervals = parse_llm_clip_response(
-        response,
-        segments,
-        min_len,
-        max_len,
-        last_word_pad
-    )
+    for part_name, transcript in parts:
+        print(f"[LLM] Analyzing {part_name}...")
+        try:
+            response = call_openai_for_clips(
+                system_prompt=system_prompt,
+                transcript=transcript,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            
+            candidates = parse_llm_clip_response(
+                response,
+                segments,
+                min_len,
+                max_len,
+                last_word_pad
+            )
+            
+            # Tag candidates with source part
+            for c in candidates:
+                c["source_part"] = part_name
+                
+            all_candidates.extend(candidates)
+            print(f"[LLM] {part_name} yielded {len(candidates)} candidates.")
+            
+        except Exception as e:
+            print(f"[LLM] Error analyzing {part_name}: {e}")
+            
+    # Deduplicate (prevent near-duplicate time ranges)
+    # Sort by viral_score descending first
+    all_candidates.sort(key=lambda x: x.get("viral_score", 0), reverse=True)
     
-    # Limit to requested number
-    intervals = intervals[:num_highlights]
+    unique_clips = []
+    for cand in all_candidates:
+        is_duplicate = False
+        for kept in unique_clips:
+            # Check for significant overlap (> 50%)
+            start1, end1 = cand["start"], cand["end"]
+            start2, end2 = kept["start"], kept["end"]
+            overlap = max(0, min(end1, end2) - max(start1, start2))
+            dur1 = end1 - start1
+            if overlap > (dur1 * 0.5):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique_clips.append(cand)
+            
+    # Select top N
+    final_selection = unique_clips[:num_highlights]
     
-    if intervals:
-        print(f"[LLM] Selected {len(intervals)} interval(s):")
-        for idx, hl in enumerate(intervals, start=1):
+    # Sort chronologically for final output
+    final_selection.sort(key=lambda x: x["start"])
+    
+    if final_selection:
+        print(f"[LLM] Final Selection ({len(final_selection)} clips):")
+        for idx, hl in enumerate(final_selection, start=1):
+            score = hl.get("viral_score", 0)
             print(
                 f"  #{idx}: {hl['start']:.2f}s -> {hl['end']:.2f}s "
-                f"(len={hl['end'] - hl['start']:.2f}s)"
+                f"(Score: {score}/10) [{hl.get('source_part', '?')}]"
             )
             if hl.get("hook"):
                 hook_display = hl["hook"][:50] + "..." if len(hl["hook"]) > 50 else hl["hook"]
                 print(f"       Hook: \"{hook_display}\"")
     else:
-        print("[LLM] No intervals could be extracted from LLM response.")
-    
-    return intervals
+        print("[LLM] No intervals selected after multi-pass analysis.")
+        
+    return final_selection
 
 
 def extend_interval_to_last_word(

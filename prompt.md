@@ -88,6 +88,7 @@ When selecting start and end points, you must prioritize **narrative completenes
 
 ---
 
+
 ### Output Format
 
 Present your final output in a clean, professional format using markdown sections:
@@ -119,8 +120,18 @@ After your markdown analysis above, you **MUST** also provide a JSON code block 
       "end_seconds": 395.0,
       "hook": "The attention-grabbing hook text (in the video's language)",
       "summary": "Brief reason this clip was selected and confirmation that the idea is complete.",
+      "viral_score": 9.5,
       "idea_completion": "yes",
       "hashtags": ["#tag1", "#tag2", "#tag3"]
     }
   ]
 }
+```
+
+### Viral Scoring Guide (1.0 - 10.0)
+- **9.0 - 10.0 (Guaranteed Viral)**: Shocking fact, extreme emotion, massive plot twist, or universally relatable truth. Must-watch.
+- **7.0 - 8.9 (High Potential)**: Great story, strong actionable advice, or very funny moment. Strong hook.
+- **5.0 - 6.9 (Good Content)**: Solid clip, complete thought, but might lack the "wow" factor.
+- **< 5.0**: Do not select unless necessary.
+
+**INSTRUCTION UPDATE**: do not limit yourself to 5-8 clips. **Find ALL valid viral clips** in the provided transcript segment that meet the criteria. The system will filter and rank them later.
