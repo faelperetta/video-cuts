@@ -77,8 +77,9 @@ When `OPENAI_API_KEY` is set in your environment, the script automatically uses 
 - Smarter clip selection based on content understanding
 - Hook phrase identification
 - Language-aware analysis (prompt instructs LLM to match video language)
+- **Advanced System/User Prompting**: Separates instructions (system) from raw transcript (user) for higher-quality selection.
 
 The LLM prompt template is stored in `prompt.md` and can be customized.
 
 ## Bug Backlog
-- **Speaker framing still misaligns**: even after adding the Mediapipe Tasks detector and fallbacks, some exported clips keep the frame on the background instead of the speaker. Need to debug `compute_speaker_samples()` and the crop expression logic so the active person remains centered.
+- **Layout Transition Smoothing**: Occasionally, hard cuts between layouts during high-activity moments could be smoothed with cross-fades or more conservative switching logic.
