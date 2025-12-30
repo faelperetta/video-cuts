@@ -1,55 +1,74 @@
-# Video Highlights Generator
+# Video Highlights Generator (`videocuts`)
 
-This project extracts short, vertical highlight clips (TikTok, Shorts, Reels) from a long-form source video. The pipeline uses Whisper for transcription, torchaudio for loudness, and a sentiment model to score segments. Selected clips are exported with burned-in subtitles, context padding, and optional speaker-centric reframing.
+A professional, modularized video highlights generator that extracts short, vertical clips (TikTok, Shorts, Reels) from long-form source videos. This project uses AI for transcription, sentiment analysis, face tracking, and intelligent clip selection.
 
-## Features
-- Downloads source videos (via `download.py`) and transcribes them with Whisper.
-- **Automatic Language Detection**: Whisper auto-detects the video language and transcribes in that language (supports 99+ languages).
-- **LLM-Powered Clip Selection**: Optionally use OpenAI GPT models for intelligent clip identification (auto-enabled when `OPENAI_API_KEY` is set).
-- Scores every subtitle segment using energy, sentiment, and hook keywords to find engaging moments.
-- Generates multiple highlight intervals with context padding, trims subtitles, and burns clip-specific SRTs into the exported MP4s.
-- **Dynamic Multi-Speaker Layouts**: Automatically switches between SINGLE, SPLIT, and WIDE layouts within clips based on speaker detection.
-- **Animated Word-by-Word Captions**: ASS subtitles with green highlighting on the current word as it's spoken.
-- **Auto-Hook Overlay** (optional): Adds attention-grabbing text at the top of clips using hook keywords from niche config.
-- **Fast Mode**: Development mode with ultrafast encoding and reduced analysis (5-10x faster).
-- Caches intermediate artifacts (audio as compressed MP3, SRT, sentiment tensors) to speed up re-runs.
+## 🚀 Key Features
 
-## Requirements
-- Python 3.13 with the provided `.venv` (activate via `source .venv/bin/activate`).
-- ffmpeg installed on the system path.
-- GPU-optional: AV1 decoding falls back to CPU when hardware support is missing.
-- (Optional) `OPENAI_API_KEY` environment variable for LLM-based clip selection.
+- **Modular Architecture**: Professional Python package structure for high maintainability and scalability.
+- **Automatic Language Detection**: Powered by Whisper (supports 99+ languages).
+- **LLM-Powered Intelligence**: Optional OpenAI integration for viral clip identification and hook generation.
+- **Dynamic Multi-Speaker Layouts**: Automatic switching between SINGLE, SPLIT, and WIDE layouts based on real-time face tracking.
+- **Animated Captions**: Beautiful ASS subtitles with word-by-word highlighting.
+- **Auto-Hook system**: Attention-grabbing visual overlays based on content analysis.
+- **Fast Mode**: Development-optimized mode for rapid iteration (5-10x faster).
+- **Web-Ready**: Architecture designed for easy integration into FastAPI or other web services.
 
-Install dependencies:
-```bash
-pip install -r requirements.txt
+## 📁 Project Structure
+
+```text
+.
+├── src/videocuts/          # Main package
+│   ├── audio/              # Transcription & sentiment analysis
+│   ├── video/              # Tracking, frames, & processing
+│   ├── caption/            # Subtitle & hook generation
+│   ├── highlights/         # Heuristic clip selection
+│   ├── llm/                # LLM-based clip selection
+│   ├── utils/              # Shared utilities
+│   ├── config.py           # Centralized configuration
+│   ├── main.py             # Pipeline orchestrator
+│   └── cli.py              # Command-line entry point
+├── video_highlight.py      # Legacy wrapper script
+└── pyproject.toml          # Package metadata & dependencies
 ```
 
-## Usage
-1. Place or download a source video as `input.webm` (use `python download.py` if configured).
-2. Run the highlight pipeline:
-   ```bash
-   python video_highlight.py
-   ```
-3. Generated clips appear in `clips_output/`.
+## 🛠 Installation
 
-### Command-Line Options
+Requires Python 3.10+ and FFmpeg.
+
+1.  **Clone & Install Dependencies**:
+    ```bash
+    pip install -e .
+    ```
+
+2.  **External Requirements**:
+    - `ffmpeg` must be in your system PATH.
+    - `OPENAI_API_KEY` (Optional) for LLM features.
+
+## 📖 Usage
+
+### Command-Line interface
+
+You can run the project using the wrapper script or the package CLI:
 
 ```bash
-python video_highlight.py --help
+# Using the wrapper
+python video_highlight.py --input video.mp4
+
+# Using the package directly
+python -m videocuts.cli --input video.mp4 --hook --use-llm
 ```
+
+### Common Flags
 
 | Flag | Description |
-|------|-------------|
-| `--fast` | Fast mode for development - uses ultrafast encoding and reduced analysis (5-10x faster) |
-| `--hook` | Enable auto-hook overlay - adds attention-grabbing text at the top of each clip |
-| `--language LANG` | Override language detection (e.g., `pt` for Portuguese, `en` for English, `es` for Spanish) |
-| `--use-llm` | Force LLM mode for clip identification (auto-enabled if `OPENAI_API_KEY` is set) |
-| `--llm-model MODEL` | Override LLM model (default: `gpt-4o-mini`). Options: `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo` |
-| `--layout {auto,single,split,wide}` | Override layout mode (default: uses LAYOUT_MODE from config) |
-| `--content-type {coding,fitness,gaming}` | Override content type for niche-specific scoring |
-| `--input INPUT` | Override input video path |
-| `--num-clips N` | Number of highlight clips to generate |
+| :--- | :--- |
+| `--input <path>` | Path to the source video. |
+| `--hook` | Enable auto-hook text overlays. |
+| `--use-llm` | Use AI for smart clip identification. |
+| `--layout {auto,single,split,wide}` | Override the multi-speaker layout mode. |
+| `--content-type {coding,fitness,gaming}`| Use niche-specific weights for scoring. |
+| `--num-clips <N>` | Number of highlights to generate. |
+| `--fast` | Accelerate processing for previews. |
 
 ### Examples
 
@@ -57,29 +76,22 @@ python video_highlight.py --help
 # Basic highlight generation
 python video_highlight.py
 
-# Fast mode for quick preview iterations
-python video_highlight.py --fast --num-clips 1
-
-# Portuguese video with hook overlay
-python video_highlight.py --language pt --hook
-
-# Use LLM for smarter clip selection
-python video_highlight.py --use-llm --num-clips 5
-
-# Full production run: 3 clips with gaming niche, hooks, and LLM
+# Full production run: 3 clips with hooks and LLM intelligence
 python video_highlight.py --content-type gaming --num-clips 3 --hook --use-llm
+
+# Fast mode for quick iterations
+python video_highlight.py --fast --num-clips 1
 ```
 
-## LLM Mode
+## 🧠 Advanced Features
 
-When `OPENAI_API_KEY` is set in your environment, the script automatically uses GPT to analyze the transcript and identify the best viral clips. This provides:
+### LLM Mode
+When `OPENAI_API_KEY` is present, the system uses GPT-4o-mini (default) to understand the transcript context, identify the most engaging moments, and generate catchy hooks.
 
-- Smarter clip selection based on content understanding
-- Hook phrase identification
-- Language-aware analysis (prompt instructs LLM to match video language)
-- **Advanced System/User Prompting**: Separates instructions (system) from raw transcript (user) for higher-quality selection.
+### Multi-Speaker Detection
+The system analyzes face positions and lip activity to determine which layout provides the best viewing experience for the current clip context.
 
-The LLM prompt template is stored in `prompt.md` and can be customized.
+---
 
-## Bug Backlog
-- **Layout Transition Smoothing**: Occasionally, hard cuts between layouts during high-activity moments could be smoothed with cross-fades or more conservative switching logic.
+## 📜 License
+This project is provided as-is for educational and creative purposes.
