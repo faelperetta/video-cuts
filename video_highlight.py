@@ -13,6 +13,15 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import statistics
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 
 import torch
 import torchaudio
@@ -70,7 +79,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 90.0          # seconds
+    max_length: float = 120.0        # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 3           # how many clips to export
@@ -120,15 +129,15 @@ class CaptionConfig:
     """Animated caption style configuration."""
     font_name: str = "Montserrat"
     font_path: str = ""                  # Path to font file (optional, auto-detected if empty)
-    font_size: int = 58
+    font_size: int = 75                  # Larger font for mobile visibility
     primary_color: str = "&H00FFFFFF"    # White (AABBGGRR format)
     highlight_color: str = "&H0000FF00"  # Bright green for current word
     outline_color: str = "&H00000000"    # Black outline
     back_color: str = "&H80000000"       # Semi-transparent black background
-    outline_width: int = 3
+    outline_width: int = 4
     shadow_depth: int = 2
-    margin_v: int = 120                  # Vertical margin from bottom
-    words_per_line: int = 4
+    margin_v: int = 380                  # Higher margin to clear YouTube Shorts UI (desc/buttons)
+    words_per_line: int = 3              # Fewer words per line for larger font
     use_word_highlight: bool = True      # Enable word-by-word highlighting
 
 
@@ -149,8 +158,9 @@ class HookConfig:
     fade_in: float = 0.4              # Slightly longer fade-in
     display_duration: float = 4.0     # Longer display time (4 seconds)
     fade_out: float = 0.5             # Slightly longer fade-out
-    box_padding: int = 28             # More padding around text
-    box_border_w: int = 8             # Softer border (simulate rounded)
+    box_padding: int = 40             # Increased padding as requested
+    box_border_w: int = 8             # (Unused in Pillow mode)
+    corner_radius: int = 20           # Radius for rounded corners
     shadow_color: str = "#00000000"   # No shadow (fully transparent)
 
 
@@ -1130,6 +1140,150 @@ def _extract_hook_around_keyword(
     return result
 
 
+def create_hook_image(
+    text: str,
+    output_path: str,
+    target_w: int = 1080,
+    target_h: int = 1920
+) -> str:
+    """
+    Generate a transparent PNG with the hook text in a rounded box.
+    Uses Pillow for high-quality rendering.
+    """
+    if Image is None:
+        print("[Hook] Pillow not found, falling back to FFmpeg drawtext (no rounded corners).")
+        return ""
+
+    # Constants from config
+    FONT_SIZE = cfg.hook.font_size
+    PADDING = cfg.hook.box_padding
+    RADIUS = cfg.hook.corner_radius
+    BG_COLOR = cfg.hook.bg_color
+    TEXT_COLOR = cfg.hook.primary_color
+    FONT_PATH = get_font_path_with_fallback(cfg.hook.font_name, cfg.hook.font_path, bold=True)
+    
+    # Create font
+    try:
+        font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+    except IOError:
+        font = ImageFont.load_default()
+        print(f"[Hook] Could not load font {FONT_PATH}, using default.")
+
+    # max width for text box
+    # Leave some margin on sides
+    MAX_BOX_WIDTH = target_w - 100 
+    MAX_TEXT_WIDTH = MAX_BOX_WIDTH - (2 * PADDING)
+
+    # Word wrap
+    words = text.split()
+    lines = []
+    current_line = []
+    
+    # Simple word wrap loop
+    for word in words:
+        test_line = " ".join(current_line + [word])
+        # Get width using getbbox (left, top, right, bottom)
+        bbox = font.getbbox(test_line)
+        w = bbox[2] - bbox[0]
+        
+        if w <= MAX_TEXT_WIDTH:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+    if current_line:
+        lines.append(" ".join(current_line))
+        
+    print(f"[Hook] Wrapped text to {len(lines)} lines.")
+    
+    # Calculate box dimensions
+    # 'ascent' + 'descent' is cleaner but basic bbox height works for now
+    # We estimate line height to be slightly more than font size
+    line_height = int(FONT_SIZE * 1.3)
+    total_text_height = len(lines) * line_height
+    
+    # Calculate max line width for the box width (tight fit)
+    max_line_w = 0
+    for line in lines:
+        bbox = font.getbbox(line)
+        w = bbox[2] - bbox[0]
+        if w > max_line_w:
+            max_line_w = w
+            
+    box_w = max_line_w + (2 * PADDING)
+    box_h = total_text_height + (2 * PADDING)
+    
+    # Create image
+    # Use RGBA for transparency
+    img = Image.new('RGBA', (target_w, target_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # Position: Centered horizontally, at configured Y
+    box_x = (target_w - box_w) // 2
+    box_y = cfg.hook.position_y
+    
+    # Draw rounded rectangle
+    # Pillow doesn't like "white@0.98", so we parse common FFmpeg colors or hex
+    fill_alpha = int(255 * cfg.hook.bg_opacity)
+    fill_color = (255, 255, 255, fill_alpha) 
+    
+    if BG_COLOR.lower() == 'white':
+         fill_color = (255, 255, 255, fill_alpha)
+    elif BG_COLOR.lower() == 'black':
+         fill_color = (0, 0, 0, fill_alpha)
+    elif BG_COLOR.startswith('#'):
+        try:
+            h = BG_COLOR.lstrip('#')
+            if len(h) == 6:
+                rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                fill_color = rgb + (fill_alpha,)
+        except Exception:
+            pass
+
+    draw.rounded_rectangle(
+        [(box_x, box_y), (box_x + box_w, box_y + box_h)],
+        radius=RADIUS,
+        fill=fill_color
+    )
+    
+    # Draw text
+    text_y = box_y + PADDING
+    # Text color
+    txt_fill = (0, 0, 0, 255)
+    if TEXT_COLOR.lower() == 'black':
+        txt_fill = (0, 0, 0, 255)
+    elif TEXT_COLOR.lower() == 'white':
+        txt_fill = (255, 255, 255, 255)
+    elif TEXT_COLOR.startswith('#'):
+         try:
+            h = TEXT_COLOR.lstrip('#')
+            if len(h) == 6:
+                rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                txt_fill = rgb + (255,)
+         except:
+             pass
+        
+    for line in lines:
+        bbox = font.getbbox(line)
+        lw = bbox[2] - bbox[0]
+        lx = box_x + (box_w - lw) // 2 # Center text in box
+        
+        # Center vertically in line height for better look
+        # (This is an approximation)
+        draw.text((lx, text_y), line, font=font, fill=txt_fill)
+        text_y += line_height
+        
+    # Save
+    try:
+        img.save(output_path)
+        print(f"[Hook] Generated overlay image: {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"[Hook] Error saving image: {e}")
+        return ""
+
+
 def generate_hook_overlay_filter(
     hook_text: str,
     target_w: int = TARGET_WIDTH,
@@ -1257,29 +1411,76 @@ def generate_hook_overlay_filter(
     return drawtext_filter
 
 
+    return drawtext_filter
+
+
 def apply_hook_overlay(
     input_video: str,
     output_video: str,
     hook_text: str,
-    target_w: int = TARGET_WIDTH,
-    target_h: int = TARGET_HEIGHT
+    target_w: int = 1080,
+    target_h: int = 1920
 ) -> None:
     """
     Apply hook overlay to a video file.
     Creates a new video with the hook text animation at the top.
     """
-    hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
     
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_video,
-        "-vf", hook_filter,
-        "-c:a", "copy",
-        output_video
-    ]
+    # Try Pillow generation first
+    temp_img = "temp_hook_overlay.png"
+    img_path = create_hook_image(hook_text, temp_img, target_w, target_h)
+    
+    if img_path and os.path.exists(img_path):
+        # Use image overlay with fade chain
+        fade_in_dur = cfg.hook.fade_in
+        visible_dur = cfg.hook.display_duration
+        fade_out_dur = cfg.hook.fade_out
+        
+        # Calculate start/end times
+        # In this simple function, we start at t=0
+        start_t = 0
+        fade_in_end = start_t + fade_in_dur
+        visible_end = fade_in_end + visible_dur
+        fade_out_end = visible_end + fade_out_dur
+        
+        # Filter complex:
+        # [1:v] input image
+        # fade in from 0 to fade_in_end
+        # fade out from visible_end to fade_out_end
+        # overlay on top of [0:v]
+        
+        filter_complex = (
+            f"[1:v]format=rgba,fade=in:st={start_t}:d={fade_in_dur}:alpha=1,"
+            f"fade=out:st={visible_end}:d={fade_out_dur}:alpha=1[hook];"
+            f"[0:v][hook]overlay=0:0"
+        )
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_video,
+            "-i", img_path,
+            "-filter_complex", filter_complex,
+            "-c:a", "copy",
+            output_video
+        ]
+        cleanup_img = True
+    else:
+        # Fallback to drawtext string
+        hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_video,
+            "-vf", hook_filter,
+            "-c:a", "copy",
+            output_video
+        ]
+        cleanup_img = False
     
     print(f"[Hook] Applying hook overlay: '{hook_text}'")
     subprocess.run(cmd, check=True, capture_output=True)
+    
+    if cleanup_img and os.path.exists(temp_img):
+        os.remove(temp_img)
 
 
 # ==========================
@@ -1655,9 +1856,45 @@ def call_openai_for_clips(
     print(f"[LLM] Calling OpenAI API ({model})...")
     print(f"[LLM] System prompt: {len(system_prompt)} chars, Transcript: {len(transcript)} chars")
     
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
+    # Detect reasoning models (o1, o3, etc.) which use different parameters
+    is_reasoning_model = model.startswith("o")
+    
+    # JSON Schema for Structured Outputs (supported by gpt-4o and o-series)
+    CLIPS_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "language": {"type": "string"},
+            "niche": {"type": "string"},
+            "video_themes": {"type": "array", "items": {"type": "string"}},
+            "clips": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "clip_number": {"type": "number"},
+                        "start_seconds": {"type": "number"},
+                        "end_seconds": {"type": "number"},
+                        "hook": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "viral_score": {"type": "number"},
+                        "idea_completion": {"type": "string", "enum": ["yes", "no"]},
+                        "hashtags": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": [
+                        "clip_number", "start_seconds", "end_seconds", 
+                        "hook", "summary", "viral_score", "idea_completion", "hashtags"
+                    ],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["language", "niche", "video_themes", "clips"],
+        "additionalProperties": False
+    }
+
+    params = {
+        "model": model,
+        "messages": [
             {
                 "role": "system",
                 "content": system_prompt
@@ -1667,12 +1904,34 @@ def call_openai_for_clips(
                 "content": f"Analyze this video transcript and extract the best viral clips:\n\n{transcript}"
             }
         ],
-        max_tokens=max_tokens,
-        temperature=temperature
-    )
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "viral_clips_extraction",
+                "strict": True,
+                "schema": CLIPS_SCHEMA
+            }
+        }
+    }
+    
+    if is_reasoning_model:
+        # o-series models use max_completion_tokens and do not support temperature
+        # We increase the limit significantly because they use many tokens for "thinking" (Chain of Thought)
+        params["max_completion_tokens"] = max(max_tokens, 25000)
+    else:
+        params["max_tokens"] = max_tokens
+        params["temperature"] = temperature
+        
+    response = client.chat.completions.create(**params)
     
     content = response.choices[0].message.content
     print(f"[LLM] Received response ({len(content)} chars)")
+    # Debug print for user
+    if content:
+        print("-" * 40)
+        print("[LLM] DEBUG - Raw Response Content:")
+        print(content)
+        print("-" * 40)
     return content
 
 
@@ -1691,14 +1950,17 @@ def parse_llm_clip_response(
     
     # Find JSON block in the response
     json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
-    if not json_match:
-        # Try to find raw JSON object
-        json_match = re.search(r'\{\s*"(?:niche|clips)"[\s\S]*\}', response)
-        if not json_match:
-            print("[LLM] Warning: Could not find JSON block in response")
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        # Try to find the start of a JSON object '{'
+        start_idx = response.find('{')
+        end_idx = response.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = response[start_idx:end_idx+1]
+        else:
+            print("[LLM] Warning: Could not find any JSON structure in response")
             return []
-    
-    json_str = json_match.group(1) if '```' in response else json_match.group(0)
     
     try:
         data = json.loads(json_str)
@@ -1823,17 +2085,17 @@ def select_highlight_intervals_llm(
     )
     
     # Split transcript
-    parts = split_transcript_into_parts(segments)
+    parts_list = split_transcript_into_parts(segments)
     all_candidates = []
     
-    print(f"[LLM] Starting multi-pass analysis ({len(parts)} parts)...")
+    print(f"[LLM] Starting parallel multi-pass analysis ({len(parts_list)} parts)...")
     
-    for part_name, transcript in parts:
-        print(f"[LLM] Analyzing {part_name}...")
+    def process_part(part_name, transcript_text):
+        print(f"[LLM] Launching analysis for {part_name}...")
         try:
             response = call_openai_for_clips(
                 system_prompt=system_prompt,
-                transcript=transcript,
+                transcript=transcript_text,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature
@@ -1851,11 +2113,26 @@ def select_highlight_intervals_llm(
             for c in candidates:
                 c["source_part"] = part_name
                 
-            all_candidates.extend(candidates)
-            print(f"[LLM] {part_name} yielded {len(candidates)} candidates.")
-            
+            return part_name, candidates
         except Exception as e:
             print(f"[LLM] Error analyzing {part_name}: {e}")
+            return part_name, []
+
+    # Process all parts in parallel
+    with ThreadPoolExecutor(max_workers=len(parts_list)) as executor:
+        future_to_part = {
+            executor.submit(process_part, name, text): name 
+            for name, text in parts_list
+        }
+        
+        for future in as_completed(future_to_part):
+            part_name = future_to_part[future]
+            try:
+                _, candidates = future.result()
+                all_candidates.extend(candidates)
+                print(f"[LLM] {part_name} yielded {len(candidates)} candidates.")
+            except Exception as e:
+                print(f"[LLM] Parallel error in {part_name}: {e}")
             
     # Deduplicate (prevent near-duplicate time ranges)
     # Sort by viral_score descending first
@@ -3152,12 +3429,15 @@ def create_vertical_with_subs(
     - burn subtitles (ASS or SRT)
     - optionally add hook overlay in same pass
     """
+
+    # Validate duration
+    if duration <= 0:
+        raise ValueError(f"Clip duration must be positive, got {duration} (start={start})")
+
     cmd = ["ffmpeg", "-y"]
-
-    # Seek before input for faster cutting
-    cmd += ["-ss", f"{start:.3f}", "-i", input_video]
-    cmd += ["-t", f"{duration:.3f}"]
-
+    # Seek before input for faster cutting (limit input duration)
+    cmd += ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", input_video]
+    
     if crop_x_expr is None:
         x_expr = f"(in_w-{target_w})/2"
     else:
@@ -3174,23 +3454,65 @@ def create_vertical_with_subs(
     else:
         sub_filter = f"subtitles='{sub_path}'"
 
-    # Use filter_complex with proper quoting to handle expressions with decimals.
-    # The crop expression must be escaped to prevent ffmpeg from misinterpreting
-    # decimal points (e.g., "0.000") as filter chain separators.
-    vf = (
-        f"scale=-2:{target_h},"
+    # Define base video processing chain string
+    # We will build filter_complex dynamically
+    base_vf_chain = (
+        f"[0:v]scale=-2:{target_h},"
         f"crop={target_w}:{target_h}:'{x_expr}':0,"
         f"{sub_filter}"
     )
     
-    # Add hook overlay filter if provided (inline, no second pass)
+    # Check for hook
+    hook_img_path = None
     if hook_text:
-        hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
-        vf += f",{hook_filter}"
-        print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
+        # Try generating image
+        temp_hook_img = f"temp_hook_{int(start)}.png" # Unique temp name
+        hook_img_path = create_hook_image(hook_text, temp_hook_img, target_w, target_h)
+    
+    if hook_img_path and os.path.exists(hook_img_path):
+        # Use image overlay
+        print(f"[Hook] Using image overlay: {hook_img_path}")
+        
+        # Add simpler input for hook image
+        # Use loop 1 to treat image as a video stream
+        cmd += ["-loop", "1", "-i", hook_img_path]
+        
+        # Calculate fade times (relative to clip start 0)
+        fade_in_dur = cfg.hook.fade_in
+        visible_dur = cfg.hook.display_duration
+        fade_out_dur = cfg.hook.fade_out
+        
+        visible_end = fade_in_dur + visible_dur
+        fade_out_end = visible_end + fade_out_dur
+        
+        # Filter complex:
+        # 1. Process main video -> [main]
+        # 2. Process hook image (fade) -> [hook]
+        # 3. [main][hook]overlay -> [out]
+        # Use shortest=1 to end when main video ends
+        fc = (
+            f"{base_vf_chain}[main];"
+            f"[1:v]format=rgba,fade=in:st=0:d={fade_in_dur}:alpha=1,"
+            f"fade=out:st={visible_end}:d={fade_out_dur}:alpha=1[hook];"
+            f"[main][hook]overlay=0:0:shortest=1[out]"
+        )
+        
+        cmd += ["-filter_complex", fc, "-map", "[out]"]
+        
+        # Map audio from input video
+        cmd += ["-map", "0:a"]
+        
+    else:
+        # Fallback to single chain with drawtext
+        vf = base_vf_chain
+        if hook_text:
+             hook_filter = generate_hook_overlay_filter(hook_text, target_w, target_h)
+             vf += f",{hook_filter}"
+             print(f"[Hook] Adding hook overlay inline: '{hook_text}'")
+        
+        cmd += ["-vf", vf]
 
     cmd += [
-        "-vf", vf,
         "-r", str(fps),
         "-c:v", "libx264",
         "-preset", cfg.video.ffmpeg_preset,
@@ -3203,6 +3525,12 @@ def create_vertical_with_subs(
 
     run_ffmpeg_cmd(cmd)
     print(f"[Output] Wrote '{output_video}'.")
+    
+    if hook_img_path and os.path.exists(hook_img_path):
+        try:
+            os.remove(hook_img_path)
+        except:
+            pass
 
 
 def create_split_screen_clip(
@@ -3953,6 +4281,9 @@ def main():
         clip_start = interval["start"]
         clip_end = interval["end"]
         duration = clip_end - clip_start
+        if duration <= 0:
+            print(f"[Error] Skipping clip {idx+1}: duration is not positive (start={clip_start}, end={clip_end})")
+            continue
 
         # Sequential naming: clip_1.mp4, clip_2.mp4, clip_3.mp4, etc.
         output_name = f"clip_{idx + 1}.mp4"
