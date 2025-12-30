@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videocuts"
+version = "0.1.0"
+description = "A modular video highlight generator using AI"
+dependencies = [
+    "torch",
+    "torchaudio",
+    "openai-whisper",
+    "transformers",
+    "numpy",
+    "opencv-python",
+    "mediapipe",
+    "pillow",
+    "openai",
+    "requests",
+]
+
+[project.scripts]
+videocuts = "videocuts.cli:main"
