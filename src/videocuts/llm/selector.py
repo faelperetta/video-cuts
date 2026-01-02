@@ -1,9 +1,12 @@
 import os
 import json
 import re
+import logging
 from typing import List, Dict, Tuple, Optional
 from videocuts.config import Config
 from videocuts.highlights.selector import extend_interval_to_last_word
+
+logger = logging.getLogger(__name__)
 
 CLIPS_SCHEMA = {
     "type": "object",
@@ -49,7 +52,7 @@ def format_timestamp_simple(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
 def format_transcript_for_llm(segments: List[Dict]) -> str:
-    return "\n".join([f"[{format_timestamp_simple(s['start'])}] {s['text'].strip()}" for s in segments])
+    return "\n".join([f"[{int(s['start'])}] {s['text'].strip()}" for s in segments])
 
 def build_system_prompt(template: str, num: int, min_d: float, max_d: float, niche: Optional[str] = None) -> str:
     p = template.replace("5–8 high-potential viral clips", f"{num} high-potential viral clips")
@@ -69,20 +72,59 @@ def call_openai_for_clips(system_p: str, transcript: str, model: str = "gpt-4o-m
 def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l: float, pad: float) -> List[Dict]:
     match = re.search(r'```json\s*([\s\S]*?)\s*```', resp)
     json_str = match.group(1) if match else resp[resp.find('{'):resp.rfind('}')+1]
-    try: data = json.loads(json_str)
-    except: return []
+    try: 
+        data = json.loads(json_str)
+    except Exception as e: 
+        logger.error(f"Failed to parse LLM JSON: {e}")
+        logger.debug(f"Raw response: {resp}")
+        return []
     
     clips, dur = data.get("clips", []), max((s["end"] for s in segments), default=0.0)
     intervals = []
     for c in clips:
-        s, e = float(c.get("start_seconds", 0)), float(c.get("end_seconds", 0))
+        s_raw = c.get("start_seconds", 0)
+        e_raw = c.get("end_seconds", 0)
+        
+        # Ensure we have floats
+        try:
+            s = float(s_raw)
+            e = float(e_raw)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid timestamp types from LLM: start={s_raw}, end={e_raw}. Skipping clip.")
+            continue
+
+        logger.debug(f"LLM proposed clip: {s:.2f}s - {e:.2f}s (Raw: {s_raw}, {e_raw})")
+
+        # Basic constraints
         if e - s < min_l:
+            logger.debug(f"Clip too short ({e-s:.2f}s < {min_l}s), expanding symmetrically.")
             defic = min_l - (e - s)
-            s, e = max(s - defic / 2, 0), min(e + defic / 2, dur)
-        elif e - s > max_l: e = s + max_l
-        e = extend_interval_to_last_word(segments, s, min(e, dur), pad, dur)
+            s = max(s - defic / 2, 0)
+            e = min(e + defic / 2, dur)
+        elif e - s > max_l:
+            logger.debug(f"Clip too long ({e-s:.2f}s > {max_l}s), truncating end.")
+            e = s + max_l
+        
+        # Segment alignment (preventing mid-sentence cuts)
+        e_aligned = extend_interval_to_last_word(segments, s, min(e, dur), pad, dur)
+        if abs(e_aligned - e) > 0.1:
+            logger.debug(f"End adjusted for segment boundary: {e:.2f}s -> {e_aligned:.2f}s")
+        e = e_aligned
+
         vs = float(c.get("viral_score", 5.0))
-        intervals.append({"start": s, "end": e, "score": vs, "viral_score": vs, "text": c.get("hook", ""), "hook": c.get("hook", ""), "summary": c.get("summary", ""), "idea_completion": c.get("idea_completion", None), "hashtags": c.get("hashtags", None)})
+        intervals.append({
+            "start": s, 
+            "end": e, 
+            "raw_start": float(s_raw) if s_raw is not None else 0.0,
+            "raw_end": float(e_raw) if e_raw is not None else 0.0,
+            "score": vs, 
+            "viral_score": vs, 
+            "text": c.get("hook", ""), 
+            "hook": c.get("hook", ""), 
+            "summary": c.get("summary", ""), 
+            "idea_completion": c.get("idea_completion", None), 
+            "hashtags": c.get("hashtags", None)
+        })
     return intervals
 
 def split_transcript_into_parts(segments: List[Dict]) -> List[Tuple[str, str]]:

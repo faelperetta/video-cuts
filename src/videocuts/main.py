@@ -93,7 +93,11 @@ def run_pipeline(cfg: Config):
             logger.debug(f"  Desc:  {desc}")
             logger.debug(f"  Score: {score}")
             logger.debug(f"  Tags:  {tags}")
-            logger.debug(f"  Time:  {clip['start']:.2f}s - {clip['end']:.2f}s")
+            time_str = f"{clip['start']:.2f}s - {clip['end']:.2f}s"
+            if "raw_start" in clip and "raw_end" in clip:
+                if abs(clip["raw_start"] - clip["start"]) > 0.1 or abs(clip["raw_end"] - clip["end"]) > 0.1:
+                    time_str += f" (LLM intended: {clip['raw_start']:.2f}s - {clip['raw_end']:.2f}s)"
+            logger.debug(f"  Time:  {time_str}")
         logger.debug("-------------------------------")
 
     if not highlight_intervals:
