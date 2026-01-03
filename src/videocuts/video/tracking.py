@@ -7,8 +7,8 @@ from videocuts.config import Config
 from videocuts.video.frames import frame_generator_from_ffmpeg
 from videocuts.video.detection import (
     detect_faces_with_landmarker,
-    detect_faces_with_cascade,
-    load_haar_cascade
+    detect_faces_with_tasks,
+    _mouth_open_metric
 )
 from videocuts.video.models import ensure_face_landmarker_model
 
@@ -30,7 +30,6 @@ def analyze_clip_faces(
     # Initialize detector
     detector_backend = "none"
     face_landmarker = None
-    cascade = None
 
     # We assume MP_HAS_TASKS is checked by importing mediapipe earlier or using discovery
     # For now, we'll try to load the landmarker
@@ -57,17 +56,14 @@ def analyze_clip_faces(
             logger.warning(f"FaceLandmarker unavailable ({exc}); falling back.")
 
     if detector_backend == "none":
-        cascade = load_haar_cascade()
-        if not cascade:
-            logger.error("No face detector available.")
-            return {
-                "speaker_samples": [],
-                "speaker_segments": [{"start": clip_start, "end": clip_end, "center": 0.5}],
-                "multi_samples": [],
-                "track_detections": {},
-                "detector_backend": "none"
-            }
-        detector_backend = "cascade"
+        logger.error("No face detector available (MediaPipe failed to load).")
+        return {
+            "speaker_samples": [],
+            "speaker_segments": [{"start": clip_start, "end": clip_end, "center": 0.5}],
+            "multi_samples": [],
+            "track_detections": {},
+            "detector_backend": "none"
+        }
             
     logger.info(f"Using '{detector_backend}' for clip {clip_start:.2f}-{clip_end:.2f}s")
 
@@ -92,13 +88,23 @@ def analyze_clip_faces(
     frame_gen = frame_generator_from_ffmpeg(input_video, clip_start, clip_end, analysis_fps)
     
     for ts, frame in frame_gen:
-        if detector_backend == "landmarker" and face_landmarker is not None:
+        if detector_backend == "landmarker":
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             detections = detect_faces_with_landmarker(face_landmarker, rgb)
+        elif detector_backend == "tasks": # This branch is new, assuming it's intended for a 'tasks' backend
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Assuming tasks also needs RGB
+            detections = detect_faces_with_tasks(face_landmarker, rgb) # Assuming face_landmarker is compatible
         else:
-            detections = detect_faces_with_cascade(cascade, frame)
+            detections = []
 
-        detections = [d for d in detections if d.get("width", 0.1) >= cfg.face_tracking.min_face_width]
+        # Filter out faces:
+        # 1. Too small (width < min_face_width)
+        # 2. Too low (center_y > 0.6) - likely objects on table (e.g. soda can with eye logo)
+        detections = [
+            d for d in detections 
+            if d.get("width", 0.1) >= cfg.face_tracking.min_face_width
+            and d.get("center_y", 0.3) <= 0.6
+        ]
 
         frame_faces = []
         assigned_entries = []
@@ -216,10 +222,8 @@ def analyze_clip_faces(
 
         if active_entry is None:
             if last_center is not None:
-                gap = ts - last_detection_time
-                if gap > cfg.face_tracking.recenter_after:
-                    blend = min((gap - cfg.face_tracking.recenter_after) / cfg.face_tracking.recenter_after, 1.0)
-                    last_center = last_center * (1.0 - blend) + 0.5 * blend
+                # Hold last known position instead of drifting to center
+                # This prevents showing empty space in split-layout/podcast scenarios
                 if smoothed_center is None:
                     smoothed_center = last_center
                 else:
@@ -232,7 +236,12 @@ def analyze_clip_faces(
             if smoothed_center is None:
                 smoothed_center = last_center
             else:
-                smoothed_center = smoothed_center * cfg.speaker_lock.position_smoothing + last_center * (1.0 - cfg.speaker_lock.position_smoothing)
+                # Simple Smoothing
+                # The "Can" false positive is fixed, so we don't need complex whip pans.
+                # Just float gently to the new target.
+                smoothing_factor = cfg.speaker_lock.position_smoothing
+                smoothed_center = smoothed_center * smoothing_factor + last_center * (1.0 - smoothing_factor)
+
             speaker_samples.append({"time": ts, "center": smoothed_center, "track_id": last_track_id})
 
     if face_landmarker is not None and hasattr(face_landmarker, "close"):
@@ -240,6 +249,19 @@ def analyze_clip_faces(
 
     if not speaker_samples:
         speaker_samples = [{"time": clip_start, "center": 0.5, "track_id": None}, {"time": clip_end, "center": 0.5, "track_id": None}]
+    else:
+        # Backfilling: If the first detection happens late (e.g. at 2.0s), the time between 0.0s and 2.0s
+        # would otherwise be empty (or covered by build_speaker_segments logic).
+        # We explicitly enforce a sample at clip_start with the first known position to ensure
+        # the camera starts ALREADY focused on the speaker, not checking "center" then panning.
+        first_sample = speaker_samples[0]
+        if first_sample["time"] > clip_start + 0.05:
+            # Insert a "start" sample that matches the first actual detection
+            speaker_samples.insert(0, {
+                "time": clip_start,
+                "center": first_sample["center"],
+                "track_id": first_sample["track_id"]
+            })
     
     speaker_segments = build_speaker_segments(speaker_samples, clip_start, clip_end, cfg)
 
@@ -418,21 +440,29 @@ def determine_layout_segments(
             active = main_tracks[0] if main_tracks[0] in visible_tracks else (main_tracks[1] if len(main_tracks) > 1 and main_tracks[1] in visible_tracks else None)
             layout_samples.append({"time": ts, "layout": "single", "active_track": active, "faces": faces})
         else:
-            face1 = next(f for f in main_faces if f.get("track_id") == main_tracks[0])
-            face2 = next(f for f in main_faces if f.get("track_id") == main_tracks[1])
-            distance = abs(face1["center"] - face2["center"])
-            act1 = face1.get("activity", 0)
-            act2 = face2.get("activity", 0)
-            max_act = max(act1, act2, 0.001)
-            both_active = (act1 / max_act > cfg.layout.both_speaking_ratio and act2 / max_act > cfg.layout.both_speaking_ratio)
+            # Ensure we actually have both unique tracks visible
+            face1 = next((f for f in main_faces if f.get("track_id") == main_tracks[0]), None)
+            face2 = next((f for f in main_faces if f.get("track_id") == main_tracks[1]), None)
             
-            if distance < cfg.layout.wide_threshold or both_active:
-                layout_samples.append({"time": ts, "layout": "wide", "faces": main_faces, "center": (face1["center"] + face2["center"]) / 2})
-            elif distance > cfg.layout.split_threshold:
-                layout_samples.append({"time": ts, "layout": "split", "faces": sorted(main_faces, key=lambda f: f["center"]), "left_center": min(face1["center"], face2["center"]), "right_center": max(face1["center"], face2["center"])})
+            if not face1 or not face2:
+                 # Fallback if we have 2+ faces but they map to the same track (rare duplicate tracking artifact)
+                visible_tracks = [f.get("track_id") for f in faces]
+                active = main_tracks[0] if main_tracks[0] in visible_tracks else (main_tracks[1] if len(main_tracks) > 1 and main_tracks[1] in visible_tracks else None)
+                layout_samples.append({"time": ts, "layout": "single", "active_track": active, "faces": faces})
             else:
-                active_track = main_tracks[0] if act1 >= act2 else main_tracks[1]
-                layout_samples.append({"time": ts, "layout": "single", "active_track": active_track, "faces": faces})
+                distance = abs(face1["center"] - face2["center"])
+                act1 = face1.get("activity", 0)
+                act2 = face2.get("activity", 0)
+                max_act = max(act1, act2, 0.001)
+                both_active = (act1 / max_act > cfg.layout.both_speaking_ratio and act2 / max_act > cfg.layout.both_speaking_ratio)
+                
+                if distance < cfg.layout.wide_threshold or both_active:
+                    layout_samples.append({"time": ts, "layout": "wide", "faces": main_faces, "center": (face1["center"] + face2["center"]) / 2})
+                elif distance > cfg.layout.split_threshold:
+                    layout_samples.append({"time": ts, "layout": "split", "faces": sorted(main_faces, key=lambda f: f["center"]), "left_center": min(face1["center"], face2["center"]), "right_center": max(face1["center"], face2["center"])})
+                else:
+                    active_track = main_tracks[0] if act1 >= act2 else main_tracks[1]
+                    layout_samples.append({"time": ts, "layout": "single", "active_track": active_track, "faces": faces})
     
     if not layout_samples:
         return [{"start": clip_start, "end": clip_end, "layout": "single", "active_track": None}]

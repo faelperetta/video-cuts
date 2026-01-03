@@ -46,7 +46,10 @@ def detect_faces_with_landmarker(landmarker, rgb_frame) -> List[Dict]:
         ymax = min(max(ys), 1.0)
         width = max(xmax - xmin, 1e-3)
         height = max(ymax - ymin, 1e-3)
+        width = max(xmax - xmin, 1e-3)
+        height = max(ymax - ymin, 1e-3)
         center = (xmin + xmax) / 2.0
+        center_y = (ymin + ymax) / 2.0
 
         upper_lip = face_landmarks[13]
         lower_lip = face_landmarks[14]
@@ -89,8 +92,10 @@ def detect_faces_with_tasks(detector, rgb_frame) -> List[Dict]:
         center = (bbox.origin_x + bbox.width / 2.0) / max(w, 1)
         width = bbox.width / max(w, 1)
         score = det.categories[0].score if det.categories else 0.0
+        center_y = (bbox.origin_y + bbox.height / 2.0) / max(h, 1)
         detections.append({
             "center": max(0.0, min(1.0, center)),
+            "center_y": max(0.0, min(1.0, center_y)),
             "width": max(min(width, 1.0), 1e-3),
             "activity": score
         })
@@ -106,9 +111,11 @@ def detect_faces_with_cascade(cascade, frame_bgr) -> List[Dict]:
     detections = []
     for (x, y, fw, fh) in faces:
         center = (x + fw / 2) / max(w, 1)
+        center_y = (y + fh / 2) / max(h, 1)
         width = fw / max(w, 1)
         detections.append({
             "center": max(0.0, min(1.0, center)),
+            "center_y": max(0.0, min(1.0, center_y)),
             "width": max(min(width, 1.0), 1e-3),
             "mouth_open": 0.0,
             "activity": 0.0

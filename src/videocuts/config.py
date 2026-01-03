@@ -28,13 +28,13 @@ class HighlightConfig:
 @dataclass
 class FaceTrackingConfig:
     """Face detection and tracking parameters."""
-    min_confidence: float = 0.45      # mediapipe detection confidence
+    min_confidence: float = 0.30      # mediapipe detection confidence: relaxed to catch side profiles
     analysis_fps: float = 12.0        # sampling FPS for face tracking
     track_distance: float = 0.12      # max normalized horizontal delta for same track
     track_max_gap: float = 1.0        # seconds before track is recycled
     activity_threshold: float = 0.0035  # threshold for choosing active speaker
     recenter_after: float = 1.5       # seconds without detection before easing to center
-    min_face_width: float = 0.08      # minimum face width (normalized) to consider
+    min_face_width: float = 0.03      # minimum face width (normalized): relaxed for wide shots
 
 
 @dataclass
@@ -43,7 +43,7 @@ class SpeakerLockConfig:
     min_duration: float = 3.0         # minimum seconds before switching
     switch_threshold: float = 2.0     # other speaker needs 2x more activity to switch
     smoothing_window: float = 0.5     # seconds of smoothing for crop position
-    position_smoothing: float = 0.5   # blend factor (0=instant, 1=no change)
+    position_smoothing: float = 0.9   # normal smoothing (slow/gentle)
 
 
 @dataclass
