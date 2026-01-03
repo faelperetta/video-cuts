@@ -130,6 +130,13 @@ def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l
 def split_transcript_into_parts(segments: List[Dict]) -> List[Tuple[str, str]]:
     if not segments: return []
     dur = segments[-1]["end"]
+    
+    # Optimization: If video is < 30 mins (1800s), send the whole thing in 1 shot.
+    # This saves 66% of LLM calls for short-medium videos and gives better global context.
+    if dur < 1800:
+        logger.info(f"Video duration {dur:.1f}s < 30m. Using single pass for LLM selection.")
+        return [("Full Video", format_transcript_for_llm(segments))]
+        
     parts, ranges = [], [(0.0, 0.35), (0.30, 0.68), (0.63, 1.0)]
     for i, (sr, er) in enumerate(ranges):
         ps = [s for s in segments if s["start"] >= dur * sr and s["end"] <= dur * er]

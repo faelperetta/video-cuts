@@ -88,12 +88,56 @@ def analyze_clip_faces(
     frame_gen = frame_generator_from_ffmpeg(input_video, clip_start, clip_end, analysis_fps)
     
     for ts, frame in frame_gen:
-        if detector_backend == "landmarker":
+        detections = []
+        
+        # STAGE 1: Face Detection (YOLO vs MediaPipe)
+        if cfg.face_tracking.use_yolo:
+            # YOLO v8 (High Recall)
+            from videocuts.video.detection import detect_faces_with_yolo
+            detections = detect_faces_with_yolo(cfg.face_tracking.yolo_model_path, frame)
+            
+            # STAGE 2: Landmark Extraction (MediaPipe) on Crop
+            # Only run if we have a landmarker model loaded
+            if face_landmarker is not None and detections:
+                h_frame, w_frame = frame.shape[:2]
+                mp_image = None
+                
+                for det in detections:
+                    if "box_int" not in det:
+                        continue
+                        
+                    x, y, w, h = det["box_int"]
+                    # Add padding for better landmarking
+                    pad_x = int(w * 0.1)
+                    pad_y = int(h * 0.1)
+                    x1 = max(0, x - pad_x)
+                    y1 = max(0, y - pad_y)
+                    x2 = min(w_frame, x + w + pad_x)
+                    y2 = min(h_frame, y + h + pad_y)
+                    
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.size == 0:
+                        continue
+                        
+                    # Run MP on crop
+                    # Note: We must create a new MP Image for each crop
+                    import mediapipe as mp
+                    mp_crop = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+                    result = face_landmarker.detect(mp_crop)
+                    
+                    if result.face_landmarks:
+                        # Calculate mouth open using landmarks from the first face in crop
+                        # Landmarks are normalized relative to CROP, which is fine for "mouth_open" ratio
+                        # We don't need absolute frame coordinates for mouth metric
+                        landmarks = result.face_landmarks[0]
+                        det["mouth_open"] = _mouth_open_metric(type('obj', (object,), {'landmark': landmarks}))
+
+        elif detector_backend == "landmarker":
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             detections = detect_faces_with_landmarker(face_landmarker, rgb)
-        elif detector_backend == "tasks": # This branch is new, assuming it's intended for a 'tasks' backend
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Assuming tasks also needs RGB
-            detections = detect_faces_with_tasks(face_landmarker, rgb) # Assuming face_landmarker is compatible
+        elif detector_backend == "tasks": 
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
+            detections = detect_faces_with_tasks(face_landmarker, rgb) 
         else:
             detections = []
 
