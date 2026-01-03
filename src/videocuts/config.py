@@ -34,7 +34,9 @@ class FaceTrackingConfig:
     track_max_gap: float = 1.0        # seconds before track is recycled
     activity_threshold: float = 0.0035  # threshold for choosing active speaker
     recenter_after: float = 1.5       # seconds without detection before easing to center
-    min_face_width: float = 0.03      # minimum face width (normalized): relaxed for wide shots
+    min_face_width: float = 0.05      # minimum face width (normalized): relaxed for wide shots
+    use_yolo: bool = True             # enable YOLO heavy detection
+    yolo_model_path: str = "src/videocuts/models/yolov8n-face.pt"
 
 
 @dataclass

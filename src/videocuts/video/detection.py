@@ -129,3 +129,59 @@ def load_haar_cascade():
     if cascade.empty():
         return None
     return cascade
+    
+_yolo_model = None
+
+def detect_faces_with_yolo(model_path: str, frame_bgr) -> List[Dict]:
+    """
+    Detect faces using YOLOv8-Face.
+    Returns: List of dicts with {center, center_y, width, activity, box_int}
+    """
+    global _yolo_model
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        return []
+
+    if _yolo_model is None:
+        if not os.path.exists(model_path):
+            return []
+        _yolo_model = YOLO(model_path)
+
+    h, w = frame_bgr.shape[:2]
+    
+    # Run inference
+    # conf=0.5 default, classes=0 (if standard yolo), but this is face specific so usually class 0 is face
+    results = _yolo_model(frame_bgr, verbose=False, conf=0.4, iou=0.5)
+    
+    detections = []
+    if not results:
+        return detections
+        
+    for result in results:
+        for box in result.boxes:
+            # box.xyxy is [x1, y1, x2, y2]
+            coords = box.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = coords
+            
+            # Normalize
+            width_px = x2 - x1
+            height_px = y2 - y1
+            center_x_px = x1 + width_px / 2
+            center_y_px = y1 + height_px / 2
+            
+            center = center_x_px / max(w, 1)
+            center_y = center_y_px / max(h, 1)
+            norm_width = width_px / max(w, 1)
+            
+            detections.append({
+                "center": max(0.0, min(1.0, center)),
+                "center_y": max(0.0, min(1.0, center_y)),
+                "width": max(min(norm_width, 1.0), 1e-3),
+                "mouth_open": 0.0, # Will be filled by Stage 2
+                "activity": float(box.conf[0]),
+                # Store raw integer box for Stage 2 cropping
+                "box_int": [int(x1), int(y1), int(width_px), int(height_px)] 
+            })
+            
+    return detections
