@@ -32,9 +32,9 @@ To ensure the best clips are selected from the **entire video**, follow this mul
 
 2. **Identify the niche** of the overall video content. Provide a clear, specific niche description in 1–2 sentences (e.g., "Personal finance for millennials focusing on side hustles and passive income" or "Fitness and calisthenics training with motivational storytelling").
 
-3. **Extract 5–8 high-potential viral clips** from the transcript, distributed across the entire video timeline.
-   - **Target Duration**: Ideally between **15 and 90 seconds** or the seconds you received as input.
-   - **Flexibility Rule**: If necessary to complete a thought, story, or advice, you **MUST** extend the clip up to **90 seconds**. Never sacrifice the conclusion of an idea to stay under a strict maximum limit.
+3. **Extract ALL high-potential viral clips** from the transcript. Do not limit yourself to a specific number; find every single moment that has viral potential.
+   - **Target Duration**: Flexible. Ideally between **15 and 180 seconds**.
+   - **Completeness Priority**: **Narrative completeness is the #1 rule.** It is better to have a 3-minute clip that tells a full story than a 60-second clip that cuts off early. Ignore the "short" constraint if accurate storytelling requires more time.
 
 ---
 
@@ -63,6 +63,8 @@ When selecting start and end points, you must prioritize **narrative completenes
 - **Title/Hook**: A compelling, curiosity-driven hook phrase (8–15 words max) in the video's language.
 - **Start Timestamp**: Approximate start time (e.g., 05:42).
 - **End Timestamp**: Approximate end time.
+- **Start Substring**: The exact first 5-8 words of the clip as they appear in the transcript.
+- **End Substring**: The exact last 5-8 words of the clip as they appear in the transcript.
 - **Duration**: Calculated duration in seconds.
 - **Key Content Summary**: 2–4 sentences describing the content **and confirming that the idea is fully concluded within this clip**.
 - **Idea Completion Check**: A brief statement confirming: "This clip contains a complete thought with a clear beginning, middle, and end."
@@ -118,6 +120,8 @@ After your markdown analysis above, you **MUST** also provide a JSON code block 
       "clip_number": 1,
       "start_seconds": 342.0,
       "end_seconds": 395.0,
+      "start_substring": "First 5-8 words of the clip from transcript",
+      "end_substring": "Last 5-8 words of the clip from transcript",
       "hook": "The attention-grabbing hook text (in the video's language)",
       "summary": "Brief reason this clip was selected and confirmation that the idea is complete.",
       "viral_score": 9.5,

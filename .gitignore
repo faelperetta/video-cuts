@@ -1,2 +1,3 @@
 clips_output/
 __pycache__/
+.env

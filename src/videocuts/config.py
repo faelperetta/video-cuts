@@ -17,7 +17,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 120.0        # seconds
+    max_length: float = 150.0        # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 3           # how many clips to export
@@ -84,7 +84,7 @@ class CaptionConfig:
 @dataclass
 class HookConfig:
     """Auto-hook overlay configuration."""
-    enabled: bool = False             # Controlled by --hook CLI flag
+    enabled: bool = True             # Controlled by --hook CLI flag
     scan_seconds: float = 5.0         # Seconds at start to scan for hook
     min_words: int = 3
     max_words: int = 12               # Allow slightly longer hooks
@@ -138,7 +138,7 @@ class ModelConfig:
 class LLMConfig:
     """External LLM configuration for clip identification."""
     provider: str = "openai"              # "openai"
-    model: str = "gpt-4o-mini"             # Model to use
+    model: str = "gpt-4o"             # Model to use
     enabled: bool = False                  # Auto-enabled if API key is set
     prompt_template_path: str = "prompt.md"  # Path to the prompt template
     max_tokens: int = 4000
@@ -200,6 +200,7 @@ class Config:
     force_audio_extraction: bool = False
     fast_mode: bool = False           # --fast flag for faster dev iterations
     debug: bool = False               # --debug flag for verbose logging
+    cpu_limit: int = 0                # 0 = unlimited, >0 = max threads
     
     def enable_fast_mode(self) -> None:
         """Enable fast mode for quicker development iterations."""
@@ -209,58 +210,3 @@ class Config:
         self.face_tracking.analysis_fps = 6.0
 
 
-NICHE_CONFIG = {
-    "coding": {
-        "HOOK_KEYWORDS": [
-            "here's the trick", "here is the trick", "the trick is", "the secret",
-            "no one tells you", "nobody tells you", "you won't believe",
-            "this is how you", "how to write", "how to build", "how to fix",
-            "never do this", "biggest mistake", "huge mistake", "do this instead",
-            "stop doing this", "in just one line", "in one line", "in 5 minutes",
-            "in five minutes", "let me show you", "watch this",
-        ],
-        "WEIGHTS": {
-            "emotion": 1.8,
-            "energy": 1.5,
-            "hook": 2.7,
-            "speech_rate": 0.9,
-        },
-    },
-    "fitness": {
-        "HOOK_KEYWORDS": [
-            "do this every day", "do this daily", "every morning", "every night",
-            "stop doing this", "never do this", "biggest mistake", "huge mistake",
-            "this changed my body", "this changed my life", "in 30 days",
-            "in 7 days", "in a week", "burn fat", "build muscle", "get abs",
-            "lose weight fast", "you won't believe", "here's why", "this is why",
-        ],
-        "WEIGHTS": {
-            "emotion": 2.4,
-            "energy": 2.5,
-            "hook": 2.2,
-            "speech_rate": 0.7,
-        },
-    },
-    "gaming": {
-        "HOOK_KEYWORDS": [
-            "watch this", "no way this happened", "you won't believe this",
-            "craziest thing", "insane", "this insane", "this clutch", "this play",
-            "this clip", "i shouldn't have survived", "i should not have survived",
-            "1 hp", "one hp", "no health", "speedrun", "world record", "new record",
-            "broken build", "overpowered", "op build", "broken strat",
-            "broken strategy", "you have to try this",
-        ],
-        "WEIGHTS": {
-            "emotion": 2.6,
-            "energy": 2.7,
-            "hook": 2.4,
-            "speech_rate": 0.5,
-        },
-    },
-}
-
-def get_niche_config(content_type: str):
-    if content_type not in NICHE_CONFIG:
-        raise ValueError(f"Unknown CONTENT_TYPE '{content_type}'. "
-                         f"Valid: {list(NICHE_CONFIG.keys())}")
-    return NICHE_CONFIG[content_type]

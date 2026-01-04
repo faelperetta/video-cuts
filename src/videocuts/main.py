@@ -3,12 +3,11 @@ import time
 import cv2
 import logging
 from typing import List, Dict, Optional
-from videocuts.config import Config, get_niche_config
+from videocuts.config import Config
 from videocuts.utils.system import cache_is_fresh
 from videocuts.utils.font import verify_font_available, print_font_installation_guide, get_font_path_with_fallback
 from videocuts.audio.transcription import transcribe_video, parse_srt_to_segments
-from videocuts.audio.analysis import extract_audio, compute_rms_per_segment, load_sentiment_model
-from videocuts.highlights.selector import score_segments_for_highlights, select_highlight_intervals
+from videocuts.audio.analysis import extract_audio
 from videocuts.llm.selector import detect_llm_availability, select_highlight_intervals_llm
 from videocuts.video.tracking import analyze_clip_faces, analyze_best_layout, determine_layout_segments, crop_x_expression_for_segments
 from videocuts.caption.generators import write_clip_ass
@@ -74,12 +73,9 @@ def run_pipeline(cfg: Config):
         logger.info("Using LLM for clip identification...")
         highlight_intervals = select_highlight_intervals_llm(segments, cfg.llm.prompt_template_path, cfg)
     else:
-        logger.info("Using local scoring for clip identification...")
-        rms_values = compute_rms_per_segment(audio_wav, segments)
-        tokenizer, sentiment_model = load_sentiment_model(cfg.model.sentiment_model)
-        niche_cfg = get_niche_config(cfg.content_type)
-        scored_segments = score_segments_for_highlights(segments, rms_values, tokenizer, sentiment_model, niche_cfg["HOOK_KEYWORDS"], cfg)
-        highlight_intervals = select_highlight_intervals(scored_segments, segments, cfg, segments[-1]["end"])
+        # LLM is mandatory per user requirement
+        logger.error("LLM is disabled or unavailable, but it is required for this pipeline.")
+        return []
     
     if cfg.debug:
         logger.debug("--- Highlight Clips Details ---")
@@ -100,15 +96,37 @@ def run_pipeline(cfg: Config):
             logger.debug(f"  Time:  {time_str}")
         logger.debug("-------------------------------")
 
+    # Log highlight configuration
+    logger.info("--- Highlight Configuration ---")
+    for key, value in vars(cfg.highlight).items():
+        logger.info(f"  {key}: {value}")
+    logger.info("-------------------------------")
+
+    # Limit CPU usage if requested
+    if cfg.cpu_limit > 0:
+        import torch
+        torch.set_num_threads(cfg.cpu_limit)
+        os.environ["OMP_NUM_THREADS"] = str(cfg.cpu_limit)
+        logger.info(f"Restricted CPU usage to {cfg.cpu_limit} threads")
+
     if not highlight_intervals:
         logger.error("No highlight intervals selected.")
-        return
+        return []
+
+    generated_clips = []
+    
+    # helper to get full video text
+    full_video_text = " ".join([s["text"].strip() for s in segments])
 
     # 5. Clip Generation
     for idx, interval in enumerate(highlight_intervals):
         start, end = interval["start"], interval["end"]
         duration = end - start
         if duration <= 0: continue
+        
+        # Get full text for this clip interval
+        clip_segments = [s for s in segments if s["start"] >= start and s["end"] <= end]
+        clip_full_text = " ".join([s["text"].strip() for s in clip_segments])
         
         output_name = f"clip_{idx + 1}.mp4"
         output_path = os.path.join(output_dir, output_name)
@@ -131,8 +149,8 @@ def run_pipeline(cfg: Config):
         # Hook Detection
         hook_text = interval.get("hook")
         if not hook_text and cfg.hook.enabled:
-            hook_keywords = get_niche_config(cfg.content_type)["HOOK_KEYWORDS"]
-            hook_info = detect_hook_phrase(segments, start, end, cfg)
+            # Pass empty keywords list since we removed niche config
+            hook_info = detect_hook_phrase(segments, start, end, cfg, keywords=[])
             if hook_info: hook_text = hook_info["text"]
             
         # Create Clip
@@ -143,3 +161,18 @@ def run_pipeline(cfg: Config):
             create_vertical_with_subs(input_video, ass_path, output_path, start, duration, cfg, crop_expr, hook_text)
             
         logger.info(f"Generated {output_name}")
+        
+        generated_clips.append({
+            "index": idx + 1,
+            "path": output_path,
+            "title": interval.get("seed_text", "")[:50],
+            "description": interval.get("summary", ""),
+            "start": start,
+            "end": end,
+            "viral_score": interval.get("viral_score") or interval.get("score") or 0.0,
+            "hook_text": hook_text,
+            "transcript": interval.get("seed_text", ""),
+            "clip_full_transcript": clip_full_text
+        })
+
+    return generated_clips
