@@ -22,6 +22,8 @@ CLIPS_SCHEMA = {
                     "clip_number": {"type": "number"},
                     "start_seconds": {"type": "number"},
                     "end_seconds": {"type": "number"},
+                    "start_substring": {"type": "string"},
+                    "end_substring": {"type": "string"},
                     "hook": {"type": "string"},
                     "summary": {"type": "string"},
                     "viral_score": {"type": "number"},
@@ -29,7 +31,7 @@ CLIPS_SCHEMA = {
                     "hashtags": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": [
-                    "clip_number", "start_seconds", "end_seconds", 
+                    "clip_number", "start_seconds", "end_seconds", "start_substring", "end_substring", 
                     "hook", "summary", "viral_score", "idea_completion", "hashtags"
                 ],
                 "additionalProperties": False
@@ -55,8 +57,13 @@ def format_transcript_for_llm(segments: List[Dict]) -> str:
     return "\n".join([f"[{int(s['start'])}] {s['text'].strip()}" for s in segments])
 
 def build_system_prompt(template: str, num: int, min_d: float, max_d: float, niche: Optional[str] = None) -> str:
-    p = template.replace("5–8 high-potential viral clips", f"{num} high-potential viral clips")
-    p = p.replace("15 and 90 seconds", f"{int(min_d)} and {int(max_d)} seconds")
+    # "3. Extract ALL high-potential viral clips" is now hardcoded in prompt.md, no replacement needed for count.
+    # But for duration, we might want to guide it if config overrides.
+    # However, for exhaustive search, we stick to the prompt's "Flexible" instruction unless debugging.
+    p = template
+    # p = template.replace("5–8 high-potential viral clips", f"{num} high-potential viral clips") # REMOVED
+    # p = p.replace("15 and 90 seconds", f"{int(min_d)} and {int(max_d)} seconds") # REMOVED to rely on prompt's "15-180"
+    
     if niche: p = p.replace("{{NICHE}}", niche) if "{{NICHE}}" in p else p.replace("You are an expert short-form video editor", f"You are an expert short-form video editor specializing in {niche} content")
     return p
 
@@ -68,6 +75,24 @@ def call_openai_for_clips(system_p: str, transcript: str, model: str = "gpt-4o-m
     if is_reasoning: params["max_completion_tokens"] = max(max_t, 25000)
     else: params.update({"max_tokens": max_t, "temperature": temp})
     return client.chat.completions.create(**params).choices[0].message.content
+
+def find_segment_by_text(segments: List[Dict], substring: str, start_search: float, window: float = 60.0) -> Optional[Dict]:
+    """Find the segment containing the substring near the predicted time."""
+    if not substring: return None
+    clean_sub = substring.lower().strip()
+    # Search within a window around the detailed timestamp
+    search_start = max(0, start_search - window)
+    search_end = start_search + window
+    
+    candidates = [s for s in segments if s["start"] >= search_start and s["start"] <= search_end]
+    
+    # Exact match first
+    for s in candidates:
+        if clean_sub in s["text"].lower():
+            return s
+            
+    # Fuzzy match could go here if needed, but strict substring is safer for now
+    return None
 
 def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l: float, pad: float) -> List[Dict]:
     match = re.search(r'```json\s*([\s\S]*?)\s*```', resp)
@@ -84,6 +109,8 @@ def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l
     for c in clips:
         s_raw = c.get("start_seconds", 0)
         e_raw = c.get("end_seconds", 0)
+        start_sub = c.get("start_substring", "")
+        end_sub = c.get("end_substring", "")
         
         # Ensure we have floats
         try:
@@ -93,23 +120,26 @@ def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l
             logger.warning(f"Invalid timestamp types from LLM: start={s_raw}, end={e_raw}. Skipping clip.")
             continue
 
-        logger.debug(f"LLM proposed clip: {s:.2f}s - {e:.2f}s (Raw: {s_raw}, {e_raw})")
-
-        # Basic constraints
-        if e - s < min_l:
-            logger.debug(f"Clip too short ({e-s:.2f}s < {min_l}s), expanding symmetrically.")
-            defic = min_l - (e - s)
-            s = max(s - defic / 2, 0)
-            e = min(e + defic / 2, dur)
-        elif e - s > max_l:
-            logger.debug(f"Clip too long ({e-s:.2f}s > {max_l}s), truncating end.")
-            e = s + max_l
+        logger.info(f"LLM proposed: {s:.2f}s - {e:.2f}s")
         
-        # Segment alignment (preventing mid-sentence cuts)
-        e_aligned = extend_interval_to_last_word(segments, s, min(e, dur), pad, dur)
-        if abs(e_aligned - e) > 0.1:
-            logger.debug(f"End adjusted for segment boundary: {e:.2f}s -> {e_aligned:.2f}s")
-        e = e_aligned
+        # Refine Start
+        s_seg = find_segment_by_text(segments, start_sub, s)
+        if s_seg:
+            logger.info(f"  Matched start text '{start_sub}' to segment at {s_seg['start']:.2f}s")
+            s = s_seg['start']
+        else:
+            logger.warning(f"  Start text '{start_sub}' not found near {s:.2f}s, using raw timestamp.")
+            
+        # Refine End
+        e_seg = find_segment_by_text(segments, end_sub, e)
+        if e_seg:
+            logger.info(f"  Matched end text '{end_sub}' to segment at {e_seg['end']:.2f}s")
+            e = e_seg['end']
+        else:
+            logger.warning(f"  End text '{end_sub}' not found near {e:.2f}s, using raw timestamp.")
+            # Fallback alignment
+            e_aligned = extend_interval_to_last_word(segments, s, min(e, dur), pad, dur)
+            e = e_aligned
 
         vs = float(c.get("viral_score", 5.0))
         intervals.append({
@@ -162,7 +192,15 @@ def select_highlight_intervals_llm(
     
     seen = []
     unique = []
-    for c in sorted(all_candidates, key=lambda x: x["score"], reverse=True):
+    # Sort first by explicit "yes" on completion, then by viral score
+    def sort_key(x):
+        is_complete = 1 if x.get("idea_completion", "no").lower() == "yes" else 0
+        return (is_complete, x["score"])
+
+    # Log total found before filtering
+    logger.info(f"LLM found {len(all_candidates)} candidates. Filtering top {cfg.highlight.num_highlights}...")
+
+    for c in sorted(all_candidates, key=sort_key, reverse=True):
         if not any(abs(c["start"] - s["start"]) < 10 for s in seen):
             seen.append(c)
             unique.append(c)

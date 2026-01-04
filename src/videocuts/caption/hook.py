@@ -13,16 +13,11 @@ def detect_hook_phrase(
     segments: List[Dict],
     clip_start: float,
     clip_end: float,
-    cfg: Config
+    cfg: Config,
+    keywords: Optional[List[str]] = None
 ) -> Optional[Dict]:
     """Detect a catchy hook phrase from the first few seconds of a clip."""
-    hook_keywords = Config().get_niche_config(cfg.content_type)["HOOK_KEYWORDS"] if hasattr(cfg, 'content_type') else []
-    # If the above line fails, we can just use an empty list or pass hook_keywords explicitly.
-    # Actually, Config is a class, the instance should be passed or we should use get_niche_config from config.py
-    
-    from videocuts.config import get_niche_config
-    niche_cfg = get_niche_config(cfg.content_type)
-    hook_keywords = niche_cfg["HOOK_KEYWORDS"]
+    hook_keywords = keywords if keywords is not None else []
     
     scan_seconds = cfg.hook.scan_seconds
     min_words = cfg.hook.min_words

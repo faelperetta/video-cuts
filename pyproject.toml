@@ -17,6 +17,14 @@ dependencies = [
     "pillow",
     "openai",
     "requests",
+    # Web API
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "yt-dlp",
+    "python-dotenv",
+    "pydantic-settings",
 ]
 
 [project.scripts]
