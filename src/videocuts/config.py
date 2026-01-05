@@ -17,10 +17,10 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 150.0        # seconds
+    max_length: float = 180.0        # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
-    num_highlights: int = 3           # how many clips to export
+    num_highlights: int = 4           # how many clips to export
     min_gap: float = 4.0              # seconds between clips
     last_word_pad: float = 0.25       # buffer to ensure last word finishes
 

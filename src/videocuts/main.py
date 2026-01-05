@@ -107,6 +107,8 @@ def run_pipeline(cfg: Config):
         import torch
         torch.set_num_threads(cfg.cpu_limit)
         os.environ["OMP_NUM_THREADS"] = str(cfg.cpu_limit)
+        # Prevent OpenCV from spawning its own thread pool to avoid contention
+        cv2.setNumThreads(1)
         logger.info(f"Restricted CPU usage to {cfg.cpu_limit} threads")
 
     if not highlight_intervals:

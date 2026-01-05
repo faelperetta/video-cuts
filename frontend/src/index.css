@@ -2,7 +2,7 @@
   font-family: 'Inter', system-ui, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  font-size: 14px;
+  font-size: 16px;
 
   color-scheme: dark;
   color: rgba(255, 255, 255, 0.87);
@@ -25,14 +25,14 @@
   --card-radius: 8px;
   --button-radius: 6px;
   --transition-smooth: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  --font-size-base: 0.875rem;
-  /* 14px */
-  --font-size-sm: 0.75rem;
-  /* 12px */
-  --font-size-lg: 1rem;
+  --font-size-base: 1rem;
   /* 16px */
-  --font-size-xl: 1.125rem;
+  --font-size-sm: 0.875rem;
+  /* 14px */
+  --font-size-lg: 1.125rem;
   /* 18px */
+  --font-size-xl: 1.25rem;
+  /* 20px */
   --font-size-2xl: 1.5rem;
   /* 24px */
 }

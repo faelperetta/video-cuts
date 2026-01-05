@@ -26,10 +26,20 @@ const FeatureIcon = ({ icon: Icon, label }) => (
   </div>
 );
 
+const getYoutubeThumbnail = (url) => {
+  if (!url) return null;
+  const regExp = /^.*(youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+  const match = url.match(regExp);
+  if (match && match[2].length === 11) {
+    return `https://img.youtube.com/vi/${match[2]}/hqdefault.jpg`;
+  }
+  return null;
+};
+
 const ProjectCard = ({ project }) => {
   const navigate = useNavigate();
   const isProcessing = ['pending', 'downloading', 'processing'].includes(project.status.toLowerCase());
-  const thumbnail = project.id ? `${API_BASE_URL}/v1/projects/${project.id}/thumbnail` : null;
+  const thumbnail = getYoutubeThumbnail(project.original_url);
 
   return (
     <motion.div
@@ -37,12 +47,12 @@ const ProjectCard = ({ project }) => {
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       className="project-card"
-      onClick={() => project.status === 'completed' && navigate(`/projects/${project.id}`)}
-      style={{ cursor: project.status === 'completed' ? 'pointer' : 'default' }}
+      onClick={() => ['completed', 'failed'].includes(project.status.toLowerCase()) && navigate(`/projects/${project.id}`)}
+      style={{ cursor: ['completed', 'failed'].includes(project.status.toLowerCase()) ? 'pointer' : 'default' }}
     >
       <div className="card-thumbnail">
-        {project.original_title ? (
-          <img src={thumbnail} alt={project.original_title} onError={(e) => {
+        {thumbnail ? (
+          <img src={thumbnail} alt={project.original_title || project.name} onError={(e) => {
             e.target.src = 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?q=80&w=1000&auto=format&fit=crop';
             e.target.style.opacity = 0.5;
           }} />
@@ -55,7 +65,7 @@ const ProjectCard = ({ project }) => {
       </div>
       <div className="card-info">
         <h3 className="card-title">{project.original_title || project.name || 'Untitled Video'}</h3>
-        <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
+        <p style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
           {new Date(project.created_at).toLocaleDateString()}
         </p>
 
@@ -71,7 +81,7 @@ const ProjectCard = ({ project }) => {
         )}
 
         {project.status === 'completed' && (
-          <p style={{ fontSize: '0.75rem', color: 'var(--accent-secondary)', fontWeight: 600 }}>
+          <p style={{ fontSize: 'var(--font-size-sm)', color: 'var(--accent-secondary)', fontWeight: 600 }}>
             {project.clips_count || 0} clips generated
           </p>
         )}
