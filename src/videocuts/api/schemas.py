@@ -67,6 +67,7 @@ class ProjectListResponse(BaseModel):
     name: str
     status: ProjectStatus
     original_title: Optional[str] = None
+    original_url: str
     created_at: datetime
     clips_count: int = 0
 

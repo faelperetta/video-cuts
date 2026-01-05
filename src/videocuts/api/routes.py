@@ -24,6 +24,7 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
     from videocuts.api.database import AsyncSessionLocal
     from videocuts.config import Config
     from videocuts.main import run_pipeline
+    from starlette.concurrency import run_in_threadpool
     
     async with AsyncSessionLocal() as db:
         # Get project
@@ -34,15 +35,23 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             return
         
         try:
+            logger.info(f"Starting background task for project {project_id} (skip_download={skip_download})")
             video_info = {}
+            
+            # Immediately set to PROCESSING if we are skipping download (rerun)
+            if skip_download:
+                project.status = ProjectStatus.PROCESSING
+                await db.commit()
+                logger.info(f"Set project {project_id} status to PROCESSING (RERUN)")
+
             if not skip_download:
                 # Update status to downloading
                 project.status = ProjectStatus.DOWNLOADING
                 await db.commit()
                 
-                # Download video
+                # Download video (Offload to threadpool)
                 logger.info(f"Downloading video for project {project_id}")
-                video_info = download_video(url, work_dir, "source")
+                video_info = await run_in_threadpool(download_video, url, work_dir, "source")
                 project.original_title = video_info["title"]
                 await db.commit()
             else:
@@ -50,7 +59,7 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
                 logger.info(f"Skipping download for project {project_id}")
                 from glob import glob
                 # Find source video
-                files = glob(os.path.join(work_dir, "source.*"))
+                files = await run_in_threadpool(glob, os.path.join(work_dir, "source.*"))
                 if not files:
                     raise FileNotFoundError("Source video not found for rerun")
                 video_info["file_path"] = files[0]
@@ -64,17 +73,24 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             try:
                 source_path = video_info.get("file_path")
                 if source_path and os.path.exists(source_path):
-                    cap = cv2.VideoCapture(source_path)
-                    # Seek to 5 seconds or middle of video if shorter
-                    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS)
-                    target_sec = min(5, duration / 2)
-                    cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000)
-                    ret, frame = cap.read()
-                    if ret:
-                        thumb_path = os.path.join(work_dir, "thumbnail.jpg")
-                        cv2.imwrite(thumb_path, frame)
-                        logger.info(f"Generated thumbnail for project {project_id}")
-                    cap.release()
+                    # Offload cv2 operations to threadpool
+                    def generate_thumb():
+                        cap = cv2.VideoCapture(source_path)
+                        # Seek to 5 seconds or middle of video if shorter
+                        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        duration = frame_count / fps if fps > 0 else 0
+                        target_sec = min(5, duration / 2)
+                        cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000)
+                        ret, frame = cap.read()
+                        if ret:
+                            thumb_path = os.path.join(work_dir, "thumbnail.jpg")
+                            cv2.imwrite(thumb_path, frame)
+                        cap.release()
+                        return ret
+                    
+                    await run_in_threadpool(generate_thumb)
+                    logger.info(f"Generated thumbnail for project {project_id}")
             except Exception as te:
                 logger.warning(f"Failed to generate thumbnail for project {project_id}: {te}")
             
@@ -85,36 +101,39 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             cfg.paths.project_name = work_dir
             cfg.llm.enabled = True
             
-            # Limit CPU threads to half of available cores
+            # Limit CPU threads to half of available cores, capped between 4 and 8
             import multiprocessing
             try:
                 cpu_count = multiprocessing.cpu_count()
-                cfg.cpu_limit = max(1, cpu_count // 2)
-                logger.info(f"Setting CPU limit to {cfg.cpu_limit} threads (half of {cpu_count})")
+                # Recommendation: 4-8 threads is usually ideal for system responsiveness
+                cfg.cpu_limit = min(max(4, cpu_count // 2), 8)
+                # Ensure we don't exceed actual cpu count on low-end systems
+                cfg.cpu_limit = min(cfg.cpu_limit, cpu_count)
+                logger.info(f"Setting CPU limit to {cfg.cpu_limit} threads (half of {cpu_count}, capped 4-8)")
             except Exception:
                 logger.warning("Could not determine CPU count, using default threading")
             
-            # Run pipeline and get generated clips
-            generated_clips = run_pipeline(cfg)
+            # Run pipeline and get generated clips (Offload to threadpool)
+            generated_clips = await run_in_threadpool(run_pipeline, cfg)
             
             if generated_clips:
                 for clip_data in generated_clips:
                     clip_id = str(uuid.uuid4())
                     
-                    # Generate clip thumbnail
-                    clip_thumb_path = None
-                    try:
-                        clip_source = clip_data["path"]
+                    # Generate clip thumbnail (Offload to threadpool)
+                    def generate_clip_thumb(c_data, w_dir):
+                        clip_source = c_data["path"]
                         if os.path.exists(clip_source):
                             c_cap = cv2.VideoCapture(clip_source)
                             c_ret, c_frame = c_cap.read()
                             if c_ret:
-                                thumb_filename = f"clip_{clip_data['index']}_thumb.jpg"
-                                clip_thumb_path = os.path.join(work_dir, thumb_filename)
+                                thumb_filename = f"clip_{c_data['index']}_thumb.jpg"
+                                clip_thumb_path = os.path.join(w_dir, thumb_filename)
                                 cv2.imwrite(clip_thumb_path, c_frame)
                             c_cap.release()
-                    except Exception as cte:
-                        logger.warning(f"Failed to generate thumbnail for clip {clip_data['index']}: {cte}")
+                        return True
+
+                    await run_in_threadpool(generate_clip_thumb, clip_data, work_dir)
 
                     clip = Clip(
                         id=clip_id,
@@ -192,6 +211,7 @@ async def rerun_project(
     # Reset status and clear error
     project.status = ProjectStatus.PENDING
     project.error_message = None
+    logger.info(f"Rerunning project {project_id}: setting status to PENDING")
     
     # Delete existing clips using a DELETE statement
     from sqlalchemy import delete
@@ -199,6 +219,7 @@ async def rerun_project(
     
     await db.commit()
     await db.refresh(project)
+    logger.info(f"Project {project_id} committed as PENDING, starting background task")
     
     # Queue background processing with skip_download=True
     background_tasks.add_task(
@@ -234,6 +255,7 @@ async def list_projects(
             Project.name,
             Project.status,
             Project.original_title,
+            Project.original_url,
             Project.created_at,
             func.coalesce(clips_subquery.c.count, 0).label("clips_count")
         )
@@ -251,6 +273,7 @@ async def list_projects(
             "name": row.name,
             "status": row.status,
             "original_title": row.original_title,
+            "original_url": row.original_url,
             "created_at": row.created_at,
             "clips_count": row.clips_count
         })

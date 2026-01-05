@@ -68,6 +68,12 @@ const VideoDialog = ({ clip, project, onClose }) => {
     );
 };
 
+const formatDuration = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+};
+
 const ClipCard = ({ clip, project, onClick }) => (
     <motion.div
         layout
@@ -84,15 +90,15 @@ const ClipCard = ({ clip, project, onClick }) => (
                 <Play size={24} style={{ filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))' }} />
             </div>
             <div className="status-badge" style={{ left: '1.25rem', top: '1.25rem', right: 'auto', background: 'rgba(0,0,0,0.7)' }}>
-                {Math.floor(clip.end_time - clip.start_time)}s
+                {formatDuration(clip.end_time - clip.start_time)}
             </div>
         </div>
         <div className="card-info" style={{ padding: '0.75rem' }}>
-            <h3 className="card-title" style={{ fontSize: '0.875rem', whiteSpace: 'normal', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', height: '2.5rem' }}>
+            <h3 className="card-title" style={{ fontSize: 'var(--font-size-base)', whiteSpace: 'normal', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', height: '3.25rem' }}>
                 {clip.hook_text || clip.title || `Clip #${clip.clip_index}`}
             </h3>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.25rem' }}>
-                <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>
+                <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
                     Score: {clip.viral_score?.toFixed(1) || 'N/A'}
                 </span>
             </div>
@@ -153,8 +159,8 @@ const ProjectDetails = () => {
                     </Link>
                     <div className="details-header">
                         <div>
-                            <h1 style={{ fontSize: '1.5rem' }}>{project.original_title || project.name}</h1>
-                            <p style={{ color: 'var(--text-secondary)', marginTop: '0.25rem', fontSize: '0.8rem' }}>
+                            <h1 style={{ fontSize: '1.75rem' }}>{project.original_title || project.name}</h1>
+                            <p style={{ color: 'var(--text-secondary)', marginTop: '0.25rem', fontSize: 'var(--font-size-sm)' }}>
                                 {project.original_url}
                             </p>
                         </div>
@@ -172,7 +178,7 @@ const ProjectDetails = () => {
                 <section className="projects-section">
                     <h2>All clips ({project.clips?.length || 0})</h2>
 
-                    <div className="projects-grid clips-grid" style={{ marginTop: '2rem' }}>
+                    <div className="projects-grid clips-grid" style={{ marginTop: '1.25rem' }}>
                         {project.clips?.map((clip) => (
                             <ClipCard
                                 key={clip.id}
