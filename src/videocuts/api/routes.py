@@ -13,6 +13,7 @@ from videocuts.api.models import Project, Clip, ProjectStatus
 from videocuts.api.schemas import ProjectCreate, ProjectResponse, ProjectListResponse, ProjectCreateResponse
 from videocuts.api.settings import get_settings
 from videocuts.api.download import download_video
+import cv2
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/projects", tags=["projects"])
@@ -58,6 +59,24 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             # Update status to processing
             project.status = ProjectStatus.PROCESSING
             await db.commit()
+
+            # Generate thumbnail if source exists
+            try:
+                source_path = video_info.get("file_path")
+                if source_path and os.path.exists(source_path):
+                    cap = cv2.VideoCapture(source_path)
+                    # Seek to 5 seconds or middle of video if shorter
+                    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS)
+                    target_sec = min(5, duration / 2)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000)
+                    ret, frame = cap.read()
+                    if ret:
+                        thumb_path = os.path.join(work_dir, "thumbnail.jpg")
+                        cv2.imwrite(thumb_path, frame)
+                        logger.info(f"Generated thumbnail for project {project_id}")
+                    cap.release()
+            except Exception as te:
+                logger.warning(f"Failed to generate thumbnail for project {project_id}: {te}")
             
             # Run the videocuts pipeline
             logger.info(f"Processing video for project {project_id}")
@@ -80,8 +99,25 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             
             if generated_clips:
                 for clip_data in generated_clips:
+                    clip_id = str(uuid.uuid4())
+                    
+                    # Generate clip thumbnail
+                    clip_thumb_path = None
+                    try:
+                        clip_source = clip_data["path"]
+                        if os.path.exists(clip_source):
+                            c_cap = cv2.VideoCapture(clip_source)
+                            c_ret, c_frame = c_cap.read()
+                            if c_ret:
+                                thumb_filename = f"clip_{clip_data['index']}_thumb.jpg"
+                                clip_thumb_path = os.path.join(work_dir, thumb_filename)
+                                cv2.imwrite(clip_thumb_path, c_frame)
+                            c_cap.release()
+                    except Exception as cte:
+                        logger.warning(f"Failed to generate thumbnail for clip {clip_data['index']}: {cte}")
+
                     clip = Clip(
-                        id=str(uuid.uuid4()),
+                        id=clip_id,
                         project_id=project_id,
                         clip_index=clip_data["index"],
                         title=clip_data.get("title"),
@@ -103,7 +139,7 @@ async def process_video_task(project_id: str, url: str, work_dir: str, skip_down
             logger.info(f"Project {project_id} completed successfully with {len(generated_clips or [])} clips")
             
         except Exception as e:
-            logger.error(f"Project {project_id} failed: {e}")
+            logger.error(f"Project {project_id} failed: {e}", exc_info=True)
             project.status = ProjectStatus.FAILED
             project.error_message = str(e)
             await db.commit()
@@ -183,13 +219,42 @@ async def list_projects(
     offset: int = 0,
 ):
     """List all projects."""
+    from sqlalchemy import func
+    
+    # Subquery to count clips per project
+    clips_subquery = (
+        select(Clip.project_id, func.count(Clip.id).label("count"))
+        .group_by(Clip.project_id)
+        .subquery()
+    )
+    
     result = await db.execute(
-        select(Project)
+        select(
+            Project.id,
+            Project.name,
+            Project.status,
+            Project.original_title,
+            Project.created_at,
+            func.coalesce(clips_subquery.c.count, 0).label("clips_count")
+        )
+        .outerjoin(clips_subquery, Project.id == clips_subquery.c.project_id)
         .order_by(Project.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
-    return result.scalars().all()
+    
+    # Convert result rows to dictionaries that match ProjectListResponse
+    projects = []
+    for row in result.all():
+        projects.append({
+            "id": row.id,
+            "name": row.name,
+            "status": row.status,
+            "original_title": row.original_title,
+            "created_at": row.created_at,
+            "clips_count": row.clips_count
+        })
+    return projects
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -209,3 +274,92 @@ async def get_project(
         raise HTTPException(status_code=404, detail="Project not found")
     
     return project
+
+
+@router.get("/{project_id}/thumbnail")
+async def get_project_thumbnail(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the thumbnail for a project."""
+    from fastapi.responses import FileResponse
+    
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+        
+    thumb_path = os.path.join(project.work_dir, "thumbnail.jpg")
+    if not os.path.exists(thumb_path):
+        # Fallback to a placeholder or 404
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+        
+    return FileResponse(thumb_path)
+
+
+@router.get("/{project_id}/clips/{clip_id}/video")
+async def get_clip_video(
+    project_id: str,
+    clip_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the video file for a specific clip."""
+    from fastapi.responses import FileResponse
+    
+    result = await db.execute(
+        select(Clip)
+        .where(Clip.id == clip_id)
+        .where(Clip.project_id == project_id)
+    )
+    clip = result.scalar_one_or_none()
+    
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+        
+    if not os.path.exists(clip.file_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+        
+    return FileResponse(clip.file_path, media_type="video/mp4")
+
+
+@router.get("/{project_id}/clips/{clip_id}/thumbnail")
+async def get_clip_thumbnail(
+    project_id: str,
+    clip_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the thumbnail for a specific clip."""
+    from fastapi.responses import FileResponse
+    
+    result = await db.execute(
+        select(Clip)
+        .where(Clip.id == clip_id)
+        .where(Clip.project_id == project_id)
+    )
+    clip = result.scalar_one_or_none()
+    
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+        
+    # Standard thumbnail path based on index
+    # Note: In a production app, we would store the thumb_path in the DB.
+    # For now, we follow the naming convention clip_{index}_thumb.jpg
+    # Thumbnails are stored in the project work_dir
+    project_result = await db.execute(select(Project).where(Project.id == project_id))
+    project = project_result.scalar_one_or_none()
+    
+    if not project:
+         raise HTTPException(status_code=404, detail="Project not found")
+
+    thumb_path = os.path.join(project.work_dir, f"clip_{clip.clip_index}_thumb.jpg")
+    
+    if not os.path.exists(thumb_path):
+        # Fallback to project thumbnail if clip thumb is missing
+        p_thumb = os.path.join(project.work_dir, "thumbnail.jpg")
+        
+        if p_thumb and os.path.exists(p_thumb):
+            return FileResponse(p_thumb)
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+        
+    return FileResponse(thumb_path)

@@ -1,0 +1,108 @@
+:root {
+  font-family: 'Inter', system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-size: 14px;
+
+  color-scheme: dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #0c0c0c;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* shadcn/ui inspired design tokens */
+  --bg-primary: #09090b;
+  --bg-secondary: #09090b;
+  --bg-tertiary: #18181b;
+  --accent-color: #ffffff;
+  --accent-secondary: #3b82f6;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --border-color: #27272a;
+  --card-radius: 8px;
+  --button-radius: 6px;
+  --transition-smooth: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --font-size-base: 0.875rem;
+  /* 14px */
+  --font-size-sm: 0.75rem;
+  /* 12px */
+  --font-size-lg: 1rem;
+  /* 16px */
+  --font-size-xl: 1.125rem;
+  /* 18px */
+  --font-size-2xl: 1.5rem;
+  /* 24px */
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-content: center;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  overflow-x: hidden;
+}
+
+#root {
+  width: 100%;
+  max-width: 1200px;
+  padding: 0 2rem;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  color: var(--text-primary);
+}
+
+h1 {
+  font-size: var(--font-size-2xl);
+}
+
+h2 {
+  font-size: var(--font-size-xl);
+}
+
+h3 {
+  font-size: var(--font-size-lg);
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+  font-weight: 600;
+  transition: var(--transition-smooth);
+}
+
+input {
+  font-family: inherit;
+}
+
+/* Utilities */
+.glass {
+  background: rgba(20, 20, 20, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-color);
+}
+
+.gradient-text {
+  background: linear-gradient(135deg, #fff 0%, #a1a1aa 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}

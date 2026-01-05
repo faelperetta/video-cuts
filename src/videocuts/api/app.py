@@ -3,6 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
 
 from videocuts.api.database import init_db
 from videocuts.api.routes import router as projects_router
@@ -43,6 +45,12 @@ app.add_middleware(
 
 # Include routers
 app.include_router(projects_router)
+
+# Mount static files
+from videocuts.api.settings import get_settings
+settings = get_settings()
+os.makedirs(settings.storage_path, exist_ok=True)
+app.mount("/storage", StaticFiles(directory=settings.storage_path), name="storage")
 
 
 @app.get("/health")
