@@ -68,6 +68,7 @@ class ProjectListResponse(BaseModel):
     status: ProjectStatus
     original_title: Optional[str] = None
     created_at: datetime
+    clips_count: int = 0
 
     class Config:
         from_attributes = True

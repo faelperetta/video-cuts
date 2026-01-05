@@ -94,7 +94,7 @@ class HookConfig:
     primary_color: str = "black"      # Hook text color (FFmpeg format)
     bg_color: str = "white"           # White background for hook
     bg_opacity: float = 0.98          # Nearly opaque for better readability
-    position_y: int = 100             # Slightly higher position
+    position_y: int = 850             # Centered position (approx middle of 1920p)
     fade_in: float = 0.4              # Slightly longer fade-in
     display_duration: float = 4.0     # Longer display time (4 seconds)
     fade_out: float = 0.5             # Slightly longer fade-out
@@ -138,7 +138,7 @@ class ModelConfig:
 class LLMConfig:
     """External LLM configuration for clip identification."""
     provider: str = "openai"              # "openai"
-    model: str = "gpt-4o"             # Model to use
+    model: str = "gpt-4o-mini"             # Model to use
     enabled: bool = False                  # Auto-enabled if API key is set
     prompt_template_path: str = "prompt.md"  # Path to the prompt template
     max_tokens: int = 4000
