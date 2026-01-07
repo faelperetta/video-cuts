@@ -20,7 +20,7 @@ class HighlightConfig:
     max_length: float = 180.0        # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
-    num_highlights: int = 4           # how many clips to export
+    num_highlights: int = 8           # how many clips to export
     min_gap: float = 4.0              # seconds between clips
     last_word_pad: float = 0.25       # buffer to ensure last word finishes
 
@@ -138,7 +138,7 @@ class ModelConfig:
 class LLMConfig:
     """External LLM configuration for clip identification."""
     provider: str = "openai"              # "openai"
-    model: str = "gpt-4o-mini"             # Model to use
+    model: str = "gpt-4o"             # Model to use
     enabled: bool = False                  # Auto-enabled if API key is set
     prompt_template_path: str = "prompt.md"  # Path to the prompt template
     max_tokens: int = 4000

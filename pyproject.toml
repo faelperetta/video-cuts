@@ -25,6 +25,7 @@ dependencies = [
     "yt-dlp",
     "python-dotenv",
     "pydantic-settings",
+    "faster-whisper",
 ]
 
 [project.scripts]

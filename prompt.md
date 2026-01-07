@@ -45,6 +45,7 @@ When selecting start and end points, you must prioritize **narrative completenes
 - **Start Point**: Must capture the setup or the beginning of the specific thought/story. Avoid starting in the middle of a sentence unless the context is clear.
 
 - **End Point**: Must be a **natural conversational break**. 
+  - **NEVER** create clips less than the given minimum seconds long.
   - **NEVER** cut mid-sentence.
   - **NEVER** cut right before the "payoff" or the final sentence of an explanation.
   - **NEVER** end on a cliffhanger unless it's a deliberate viral strategy (rare).
