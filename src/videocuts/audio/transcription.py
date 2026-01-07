@@ -15,26 +15,53 @@ def transcribe_video(
     language: Optional[str] = None
 ) -> Tuple[List[Dict], str]:
     """
-    Transcribe a video file using OpenAI's Whisper model.
+    Transcribe a video file using OpenAI's Whisper model (hybrid).
+    Uses faster-whisper for Intel optimized path if XPU/Intel is selected.
     """
-    logger.info(f"Loading model '{model_size}' on device '{TORCH_DEVICE}'...")
-    model = whisper.load_model(model_size, device=str(TORCH_DEVICE))
-
-    if language:
-        logger.info(f"Using specified language: '{language}'")
+    if TORCH_DEVICE.type == "xpu" or "intel" in str(TORCH_DEVICE).lower():
+        from faster_whisper import WhisperModel
+        # Note: We use device="cpu" with compute_type="int8" because native XPU 
+        # has SPIR-V symbol issues with Whisper kernels. int8 on Intel CPUs
+        # is extremely fast and avoids the LLVM duplicate option crashes.
+        logger.info(f"Loading faster-whisper model '{model_size}' (Intel optimized path)...")
+        
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        
+        logger.info(f"Transcribing '{input_video}' using faster-whisper...")
+        segments_gen, info = model.transcribe(
+            input_video,
+            language=language,
+            word_timestamps=True
+        )
+        
+        segments = []
+        for seg in segments_gen:
+            segments.append({
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text
+            })
+        detected_language = info.language
     else:
-        logger.info("Auto-detecting language...")
-    
-    logger.info(f"Transcribing '{input_video}' with word timestamps...")
-    result = model.transcribe(
-        input_video, 
-        task="transcribe", 
-        word_timestamps=True, 
-        language=language
-    )
+        import whisper
+        logger.info(f"Loading standard whisper model '{model_size}' on device '{TORCH_DEVICE}'...")
+        model = whisper.load_model(model_size, device=str(TORCH_DEVICE))
 
-    segments = result["segments"]
-    detected_language = result.get("language", language or "en")
+        if language:
+            logger.info(f"Using specified language: '{language}'")
+        else:
+            logger.info("Auto-detecting language...")
+        
+        logger.info(f"Transcribing '{input_video}' with word timestamps...")
+        result = model.transcribe(
+            input_video, 
+            task="transcribe", 
+            word_timestamps=True, 
+            language=language
+        )
+
+        segments = result["segments"]
+        detected_language = result.get("language", language or "en")
     
     logger.info(f"Detected language: '{detected_language}'")
 
