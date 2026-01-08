@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import statistics
@@ -8,6 +9,7 @@ from videocuts.video.frames import frame_generator_from_ffmpeg
 from videocuts.video.detection import (
     detect_faces_with_landmarker,
     detect_faces_with_tasks,
+    detect_faces_with_openvino,
     _mouth_open_metric
 )
 from videocuts.video.models import ensure_face_landmarker_model
@@ -55,6 +57,14 @@ def analyze_clip_faces(
         except Exception as exc:
             logger.warning(f"FaceLandmarker unavailable ({exc}); falling back.")
 
+    if cfg.face_tracking.use_openvino:
+        if os.path.exists(cfg.paths.openvino_face_model):
+            detector_backend = "openvino"
+        else:
+            logger.warning(f"OpenVINO model not found at {cfg.paths.openvino_face_model}. Falling back.")
+    elif cfg.face_tracking.use_yolo:
+        detector_backend = "yolo"
+
     if detector_backend == "none":
         logger.error("No face detector available (MediaPipe failed to load).")
         return {
@@ -90,8 +100,31 @@ def analyze_clip_faces(
     for ts, frame in frame_gen:
         detections = []
         
-        # STAGE 1: Face Detection (YOLO vs MediaPipe)
-        if cfg.face_tracking.use_yolo:
+        # STAGE 1: Face Detection
+        if detector_backend == "openvino":
+            # OpenVINO (Highest performance on Intel Arc)
+            detections = detect_faces_with_openvino(cfg.paths.openvino_face_model, frame)
+            
+            # STAGE 2: Landmark Extraction on Crop (MediaPipe)
+            if face_landmarker is not None and detections:
+                h_frame, w_frame = frame.shape[:2]
+                for det in detections:
+                    if "box_int" not in det:
+                        continue
+                    x, y, w, h = det["box_int"]
+                    pad_x, pad_y = int(w * 0.1), int(h * 0.1)
+                    x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+                    x2, y2 = min(w_frame, x + w + pad_x), min(h_frame, y + h + pad_y)
+                    face_crop = frame[y1:y2, x1:x2]
+                    if face_crop.size == 0: continue
+                    import mediapipe as mp
+                    mp_crop = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+                    result = face_landmarker.detect(mp_crop)
+                    if result.face_landmarks:
+                        landmarks = result.face_landmarks[0]
+                        det["mouth_open"] = _mouth_open_metric(type('obj', (object,), {'landmark': landmarks}))
+
+        elif detector_backend == "yolo" or cfg.face_tracking.use_yolo:
             # YOLO v8 (High Recall)
             from videocuts.video.detection import detect_faces_with_yolo
             detections = detect_faces_with_yolo(cfg.face_tracking.yolo_model_path, frame)

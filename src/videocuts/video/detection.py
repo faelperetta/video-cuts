@@ -185,3 +185,52 @@ def detect_faces_with_yolo(model_path: str, frame_bgr) -> List[Dict]:
             })
             
     return detections
+
+_ov_model = None
+
+def detect_faces_with_openvino(model_path: str, frame_bgr, device: str = "GPU") -> List[Dict]:
+    """
+    Detect faces using OpenVINO (optimized for Intel Arc).
+    """
+    global _ov_model
+    try:
+        import openvino as ov
+    except ImportError:
+        return []
+
+    try:
+        from ultralytics import YOLO
+        ov_dir = os.path.dirname(model_path)
+        
+        if _ov_model is None:
+            if not os.path.exists(ov_dir):
+                return []
+            _ov_model = YOLO(ov_dir, task="detect")
+            
+        results = _ov_model(frame_bgr, device=device.lower(), verbose=False)
+        
+        detections = []
+        if not results:
+            return detections
+            
+        h, w = frame_bgr.shape[:2]
+        for result in results:
+            for box in result.boxes:
+                coords = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = coords
+                width_px = x2 - x1
+                height_px = y2 - y1
+                center_x_px = x1 + width_px / 2
+                center_y_px = y1 + height_px / 2
+                
+                detections.append({
+                    "center": max(0.0, min(1.0, center_x_px / max(w, 1))),
+                    "center_y": max(0.0, min(1.0, center_y_px / max(h, 1))),
+                    "width": max(min(width_px / max(w, 1), 1.0), 1e-3),
+                    "mouth_open": 0.0,
+                    "activity": float(box.conf[0]),
+                    "box_int": [int(x1), int(y1), int(width_px), int(height_px)] 
+                })
+        return detections
+    except Exception:
+        return []
