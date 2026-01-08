@@ -37,6 +37,7 @@ class FaceTrackingConfig:
     min_face_width: float = 0.05      # minimum face width (normalized): relaxed for wide shots
     use_yolo: bool = True             # enable YOLO heavy detection
     yolo_model_path: str = "src/videocuts/models/yolov8n-face.pt"
+    use_openvino: bool = True         # enable OpenVINO acceleration on Intel Arc
 
 
 @dataclass
@@ -138,7 +139,7 @@ class ModelConfig:
 class LLMConfig:
     """External LLM configuration for clip identification."""
     provider: str = "openai"              # "openai"
-    model: str = "gpt-4o"             # Model to use
+    model: str = "gpt-4o-mini"             # Model to use
     enabled: bool = False                  # Auto-enabled if API key is set
     prompt_template_path: str = "prompt.md"  # Path to the prompt template
     max_tokens: int = 4000
@@ -178,6 +179,11 @@ class PathConfig:
     @property
     def face_landmarker_model(self) -> str:
         return os.path.join(self.output_dir, "models", "face_landmarker.task")
+
+    @property
+    def openvino_face_model(self) -> str:
+        # Default exported path from ultralytics
+        return "src/videocuts/models/yolov8n-face_openvino_model/yolov8n-face.xml"
 
 
 @dataclass
