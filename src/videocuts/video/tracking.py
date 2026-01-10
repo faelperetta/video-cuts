@@ -13,6 +13,7 @@ from videocuts.video.detection import (
     _mouth_open_metric
 )
 from videocuts.video.models import ensure_face_landmarker_model
+from videocuts.utils.device import is_intel_accel_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def analyze_clip_faces(
         except Exception as exc:
             logger.warning(f"FaceLandmarker unavailable ({exc}); falling back.")
 
-    if cfg.face_tracking.use_openvino:
+    if cfg.face_tracking.use_openvino and is_intel_accel_enabled():
         if os.path.exists(cfg.paths.openvino_face_model):
             detector_backend = "openvino"
         else:

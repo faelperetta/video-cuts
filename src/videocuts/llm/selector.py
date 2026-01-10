@@ -179,30 +179,63 @@ def select_highlight_intervals_llm(
     cfg: Config,
     model: str = "gpt-4o-mini"
 ) -> List[Dict]:
-    """Multi-pass LLM selection strategy to find clips."""
+    """Multi-pass LLM selection strategy to find clips with round-robin distribution."""
     try: template = load_prompt_template(prompt_path)
     except: return []
     
     system_p = build_system_prompt(template, cfg.highlight.num_highlights, cfg.highlight.min_length, cfg.highlight.max_length, cfg.content_type)
-    all_candidates = []
+    
+    # Organize candidates by part to allow rotation
+    parts_candidates = []
     
     for name, transcript in split_transcript_into_parts(segments):
         resp = call_openai_for_clips(system_p, transcript, model=model)
-        all_candidates.extend(parse_llm_clip_response(resp, segments, cfg.highlight.min_length, cfg.highlight.max_length, cfg.highlight.last_word_pad))
+        candidates = parse_llm_clip_response(resp, segments, cfg.highlight.min_length, cfg.highlight.max_length, cfg.highlight.last_word_pad)
+        
+        logger.info(f"LLM found {len(candidates)} candidates in {name}.")
+        
+        # Sort candidates within this part first
+        def sort_key(x):
+            is_complete = 1 if x.get("idea_completion", "no").lower() == "yes" else 0
+            return (is_complete, x["score"])
+        
+        candidates.sort(key=sort_key, reverse=True)
+        parts_candidates.append(candidates)
     
     seen = []
     unique = []
-    # Sort first by explicit "yes" on completion, then by viral score
-    def sort_key(x):
-        is_complete = 1 if x.get("idea_completion", "no").lower() == "yes" else 0
-        return (is_complete, x["score"])
+    
+    # Implementation of Round-Robin selection across parts
+    num_parts = len(parts_candidates)
+    if num_parts == 0:
+        return []
+        
+    part_indices = [0] * num_parts # Current pointer for each part's list
+    
+    logger.info(f"Rotating selection across {num_parts} video parts for top {cfg.highlight.num_highlights} clips...")
 
-    # Log total found before filtering
-    logger.info(f"LLM found {len(all_candidates)} candidates. Filtering top {cfg.highlight.num_highlights}...")
-
-    for c in sorted(all_candidates, key=sort_key, reverse=True):
-        if not any(abs(c["start"] - s["start"]) < 10 for s in seen):
-            seen.append(c)
-            unique.append(c)
-            if len(unique) >= cfg.highlight.num_highlights: break
+    while len(unique) < cfg.highlight.num_highlights:
+        any_added_this_loop = False
+        
+        for p_idx in range(num_parts):
+            # Check if this part still has candidates to pick from
+            if part_indices[p_idx] < len(parts_candidates[p_idx]):
+                candidate = parts_candidates[p_idx][part_indices[p_idx]]
+                part_indices[p_idx] += 1
+                any_added_this_loop = True
+                
+                # Check for temporal overlap (avoiding clips within 10s of each other)
+                if not any(abs(candidate["start"] - s["start"]) < 10 for s in seen):
+                    seen.append(candidate)
+                    unique.append(candidate)
+                    logger.info(f"  [Round-Robin] Selected clip starting at {candidate['start']:.2f}s from Part {p_idx+1}/{num_parts} (Score: {candidate['score']})")
+                    if len(unique) >= cfg.highlight.num_highlights:
+                        break
+                else:
+                    logger.debug(f"  [Round-Robin] Skipped overlapping clip at {candidate['start']:.2f}s from Part {p_idx+1}")
+        
+        # If we went through all parts and didn't find a single new candidate, we're done
+        if not any_added_this_loop:
+            break
+            
     return unique

@@ -17,7 +17,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 180.0        # seconds
+    max_length: float = 150.0        # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 8           # how many clips to export
@@ -85,7 +85,7 @@ class CaptionConfig:
 @dataclass
 class HookConfig:
     """Auto-hook overlay configuration."""
-    enabled: bool = True             # Controlled by --hook CLI flag
+    enabled: bool = False             # Controlled by --hook CLI flag
     scan_seconds: float = 5.0         # Seconds at start to scan for hook
     min_words: int = 3
     max_words: int = 12               # Allow slightly longer hooks

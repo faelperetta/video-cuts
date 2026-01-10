@@ -4,7 +4,7 @@ import whisper
 import logging
 from typing import List, Dict, Tuple, Optional
 from videocuts.utils.system import format_timestamp, parse_timestamp
-from videocuts.utils.device import TORCH_DEVICE
+from videocuts.utils.device import TORCH_DEVICE, is_intel_accel_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +16,13 @@ def transcribe_video(
 ) -> Tuple[List[Dict], str]:
     """
     Transcribe a video file using OpenAI's Whisper model (hybrid).
-    Uses faster-whisper for Intel optimized path if XPU/Intel is selected.
+    Uses faster-whisper for Intel optimized path if XPU/Intel is selected 
+    AND Intel acceleration is explicitly enabled.
     """
-    if TORCH_DEVICE.type == "xpu" or "intel" in str(TORCH_DEVICE).lower():
+    use_intel_path = (is_intel_accel_enabled() and 
+                      (TORCH_DEVICE.type == "xpu" or "intel" in str(TORCH_DEVICE).lower()))
+    
+    if use_intel_path:
         from faster_whisper import WhisperModel
         # Note: We use device="cpu" with compute_type="int8" because native XPU 
         # has SPIR-V symbol issues with Whisper kernels. int8 on Intel CPUs
