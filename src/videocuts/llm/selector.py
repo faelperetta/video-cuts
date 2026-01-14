@@ -62,7 +62,7 @@ def build_system_prompt(template: str, num: int, min_d: float, max_d: float, nic
     # However, for exhaustive search, we stick to the prompt's "Flexible" instruction unless debugging.
     p = template
     # p = template.replace("5–8 high-potential viral clips", f"{num} high-potential viral clips") # REMOVED
-    # p = p.replace("15 and 90 seconds", f"{int(min_d)} and {int(max_d)} seconds") # REMOVED to rely on prompt's "15-180"
+    p = p.replace("15 and 180 seconds", f"{int(min_d)} and {int(max_d)} seconds") # REMOVED to rely on prompt's "15-180"
     
     if niche: p = p.replace("{{NICHE}}", niche) if "{{NICHE}}" in p else p.replace("You are an expert short-form video editor", f"You are an expert short-form video editor specializing in {niche} content")
     return p
