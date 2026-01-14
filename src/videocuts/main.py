@@ -10,7 +10,7 @@ from videocuts.audio.transcription import transcribe_audio, parse_srt_to_segment
 from videocuts.audio.analysis import extract_audio_normalized
 from videocuts.models.transcript import Transcript
 import json
-from videocuts.llm.selector import detect_llm_availability, select_highlight_intervals_llm
+from videocuts.llm.selector import detect_llm_availability, select_highlight_intervals_llm_v2
 from videocuts.video.tracking import analyze_clip_faces, analyze_best_layout, determine_layout_segments, crop_x_expression_for_segments
 from videocuts.caption.generators import write_clip_ass
 from videocuts.caption.hook import detect_hook_phrase
@@ -85,10 +85,10 @@ def run_pipeline(cfg: Config):
         detected_language = transcript.language
         logger.info(f"Detected language: '{detected_language}'")
         
-    # 4. Highlight Selection
+    # 4. Highlight Selection (using scalable v2 for long videos)
     if cfg.llm.enabled and detect_llm_availability():
         logger.info("Using LLM for clip identification...")
-        highlight_intervals = select_highlight_intervals_llm(segments, cfg.llm.prompt_template_path, cfg)
+        highlight_intervals = select_highlight_intervals_llm_v2(segments, cfg.llm.prompt_template_path, cfg)
     else:
         # LLM is mandatory per user requirement
         logger.error("LLM is disabled or unavailable, but it is required for this pipeline.")
