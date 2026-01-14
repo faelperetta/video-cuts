@@ -158,11 +158,14 @@ def parse_llm_clip_response(resp: str, segments: List[Dict], min_l: float, max_l
     return intervals
 
 def split_transcript_into_parts(segments: List[Dict]) -> List[Tuple[str, str]]:
+    """
+    DEPRECATED: Use split_transcript_into_chunks() for better scalability.
+    Kept for backward compatibility.
+    """
     if not segments: return []
     dur = segments[-1]["end"]
     
-    # Optimization: If video is < 30 mins (1800s), send the whole thing in 1 shot.
-    # This saves 66% of LLM calls for short-medium videos and gives better global context.
+    # Short videos: single pass
     if dur < 1800:
         logger.info(f"Video duration {dur:.1f}s < 30m. Using single pass for LLM selection.")
         return [("Full Video", format_transcript_for_llm(segments))]
@@ -172,6 +175,118 @@ def split_transcript_into_parts(segments: List[Dict]) -> List[Tuple[str, str]]:
         ps = [s for s in segments if s["start"] >= dur * sr and s["end"] <= dur * er]
         if ps: parts.append((f"Part {i+1}/{len(ranges)}", format_transcript_for_llm(ps)))
     return parts
+
+
+# =============================================================================
+# Scalable Chunking for Long Videos
+# =============================================================================
+
+def split_transcript_into_chunks(
+    segments: List[Dict], 
+    chunk_duration_s: float = 600.0,  # 10 minutes
+    min_silence_gap: float = 1.5
+) -> List[Dict]:
+    """
+    Split transcript into chunks by time boundaries, preferring natural pauses.
+    
+    Args:
+        segments: List of transcript segments with start, end, text
+        chunk_duration_s: Target duration per chunk in seconds (default: 10 min)
+        min_silence_gap: Minimum gap between segments to consider a natural break
+    
+    Returns:
+        List of chunk dicts: {chunk_index, start_s, end_s, segments, text}
+    """
+    if not segments:
+        return []
+    
+    total_duration = segments[-1]["end"]
+    chunks = []
+    current_chunk_segments = []
+    chunk_start = 0.0
+    chunk_index = 0
+    
+    for i, seg in enumerate(segments):
+        current_chunk_segments.append(seg)
+        chunk_duration = seg["end"] - chunk_start
+        
+        # Check if we should end this chunk
+        should_split = False
+        
+        if chunk_duration >= chunk_duration_s:
+            # Look for natural break point (silence gap)
+            if i + 1 < len(segments):
+                gap = segments[i + 1]["start"] - seg["end"]
+                if gap >= min_silence_gap:
+                    should_split = True
+                # Even without silence, split if way over target
+                elif chunk_duration >= chunk_duration_s * 1.3:
+                    should_split = True
+            else:
+                should_split = True  # Last segment
+        
+        if should_split and current_chunk_segments:
+            chunk_text = " ".join([s["text"].strip() for s in current_chunk_segments])
+            chunks.append({
+                "chunk_index": chunk_index,
+                "start_s": chunk_start,
+                "end_s": seg["end"],
+                "segments": current_chunk_segments.copy(),
+                "text": chunk_text
+            })
+            chunk_index += 1
+            chunk_start = segments[i + 1]["start"] if i + 1 < len(segments) else seg["end"]
+            current_chunk_segments = []
+    
+    # Handle remaining segments
+    if current_chunk_segments:
+        chunk_text = " ".join([s["text"].strip() for s in current_chunk_segments])
+        chunks.append({
+            "chunk_index": chunk_index,
+            "start_s": chunk_start,
+            "end_s": current_chunk_segments[-1]["end"],
+            "segments": current_chunk_segments,
+            "text": chunk_text
+        })
+    
+    logger.info(f"Split {total_duration:.0f}s video into {len(chunks)} chunks")
+    return chunks
+
+
+def summarize_chunk_for_llm(chunk: Dict, max_segments: int = 50) -> str:
+    """
+    Create a condensed summary of a chunk for LLM processing.
+    
+    Preserves the [SECONDS] format the LLM prompt expects for timestamp extraction.
+    Returns format like:
+    
+    [CHUNK 3: 20:00-30:00]
+    [1200] First segment text...
+    [1205] Second segment text...
+    """
+    start_ts = format_timestamp_simple(chunk["start_s"])
+    end_ts = format_timestamp_simple(chunk["end_s"])
+    
+    # Format segments with timestamps (same format as format_transcript_for_llm)
+    segments = chunk.get("segments", [])
+    
+    # Limit segments if there are too many (prioritize evenly distributed samples)
+    if len(segments) > max_segments:
+        # Sample evenly across the chunk
+        step = len(segments) / max_segments
+        indices = [int(i * step) for i in range(max_segments)]
+        segments = [segments[i] for i in indices]
+    
+    formatted_segments = [f"[{int(s['start'])}] {s['text'].strip()}" for s in segments]
+    transcript_text = "\n".join(formatted_segments)
+    
+    return f"[CHUNK {chunk['chunk_index'] + 1}: {start_ts}-{end_ts}]\n{transcript_text}"
+
+
+def format_chunks_for_llm(chunks: List[Dict]) -> str:
+    """Format all chunks into a single string for LLM processing."""
+    summaries = [summarize_chunk_for_llm(c) for c in chunks]
+    return "\n\n".join(summaries)
 
 def select_highlight_intervals_llm(
     segments: List[Dict],
@@ -238,4 +353,113 @@ def select_highlight_intervals_llm(
         if not any_added_this_loop:
             break
             
+    return unique
+
+
+# =============================================================================
+# Scalable LLM Selection (v2)
+# =============================================================================
+
+def select_highlight_intervals_llm_v2(
+    segments: List[Dict],
+    prompt_path: str,
+    cfg: Config,
+    model: str = "gpt-4o-mini"
+) -> List[Dict]:
+    """
+    Scalable LLM selection for long videos using hierarchical summarization.
+    
+    Strategy:
+    - Video < 30 min: Single-pass with full transcript (same as v1)
+    - Video 30 min - 2 hr: Chunked summaries, single LLM call
+    - Video > 2 hr: Same as above but with smaller chunks
+    """
+    if not segments:
+        return []
+    
+    total_duration = segments[-1]["end"]
+    
+    try:
+        template = load_prompt_template(prompt_path)
+    except Exception:
+        logger.error(f"Failed to load prompt template from {prompt_path}")
+        return []
+    
+    system_p = build_system_prompt(
+        template, 
+        cfg.highlight.num_highlights, 
+        cfg.highlight.min_length, 
+        cfg.highlight.max_length, 
+        cfg.content_type
+    )
+    
+    # Choose chunk duration based on video length
+    if total_duration < 1800:  # < 30 minutes
+        chunk_duration_s = 300  # 5 min chunks for short videos
+        logger.info(f"Video {total_duration:.0f}s < 30min: Using 5-min chunks")
+    elif total_duration < 7200:  # 30 min - 2 hours
+        chunk_duration_s = 600  # 10 min chunks
+        logger.info(f"Video {total_duration:.0f}s (30min-2hr): Using 10-min chunks")
+    else:  # > 2 hours
+        chunk_duration_s = 480  # 8 min chunks for very long videos
+        logger.info(f"Video {total_duration:.0f}s (> 2hr): Using 8-min chunks")
+    
+    # Always use chunked approach with round-robin
+    chunks = split_transcript_into_chunks(segments, chunk_duration_s=chunk_duration_s)
+    transcript = format_chunks_for_llm(chunks)
+    
+    logger.info(f"Sending {len(chunks)} chunk summaries to LLM (~{len(transcript)} chars)")
+    resp = call_openai_for_clips(system_p, transcript, model=model)
+    candidates = parse_llm_clip_response(
+        resp, segments,
+        cfg.highlight.min_length, cfg.highlight.max_length,
+        cfg.highlight.last_word_pad
+    )
+    
+    logger.info(f"LLM returned {len(candidates)} clip candidates")
+    
+    # Round-robin across chunks (for all video lengths)
+    # Group candidates by which chunk they belong to
+    num_chunks = int(total_duration / chunk_duration_s) + 1
+    
+    chunk_candidates = [[] for _ in range(num_chunks)]
+    for candidate in candidates:
+        chunk_idx = min(int(candidate["start"] / chunk_duration_s), num_chunks - 1)
+        chunk_candidates[chunk_idx].append(candidate)
+    
+    # Sort within each chunk by score
+    def sort_key(x):
+        is_complete = 1 if x.get("idea_completion", "no").lower() == "yes" else 0
+        return (is_complete, x.get("score", 0))
+    
+    for chunk_list in chunk_candidates:
+        chunk_list.sort(key=sort_key, reverse=True)
+    
+    # Round-robin selection across chunks
+    unique = []
+    chunk_indices = [0] * num_chunks  # Pointer for each chunk
+    chunks_with_candidates = [i for i in range(num_chunks) if chunk_candidates[i]]
+    
+    logger.info(f"Round-robin selection across {len(chunks_with_candidates)} chunks with candidates")
+    
+    while len(unique) < cfg.highlight.num_highlights:
+        any_added = False
+        
+        for chunk_idx in chunks_with_candidates:
+            if chunk_indices[chunk_idx] < len(chunk_candidates[chunk_idx]):
+                candidate = chunk_candidates[chunk_idx][chunk_indices[chunk_idx]]
+                chunk_indices[chunk_idx] += 1
+                any_added = True
+                
+                # Check for overlap with already selected clips
+                if not any(abs(candidate["start"] - u["start"]) < 10 for u in unique):
+                    unique.append(candidate)
+                    chunk_time = f"{int(chunk_idx * chunk_duration_s / 60)}-{int((chunk_idx + 1) * chunk_duration_s / 60)}min"
+                    logger.info(f"  [Chunk {chunk_idx + 1}] Selected clip at {candidate['start']:.2f}s (Score: {candidate.get('score', 0)})")
+                    if len(unique) >= cfg.highlight.num_highlights:
+                        break
+        
+        if not any_added:
+            break
+    
     return unique
