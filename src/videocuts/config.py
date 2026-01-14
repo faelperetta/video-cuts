@@ -17,7 +17,7 @@ class VideoConfig:
 class HighlightConfig:
     """Highlight selection and timing parameters."""
     min_length: float = 15.0          # seconds
-    max_length: float = 150.0        # seconds
+    max_length: float = 80.0       # seconds
     context_before: float = 1.5       # seconds before high-scoring segment
     context_after: float = 1.5        # seconds after high-scoring segment
     num_highlights: int = 8           # how many clips to export
@@ -36,8 +36,9 @@ class FaceTrackingConfig:
     recenter_after: float = 1.5       # seconds without detection before easing to center
     min_face_width: float = 0.05      # minimum face width (normalized): relaxed for wide shots
     use_yolo: bool = True             # enable YOLO heavy detection
-    yolo_model_path: str = "src/videocuts/models/yolov8n-face.pt"
-    use_openvino: bool = True         # enable OpenVINO acceleration on Intel Arc
+    yolo_model_path: str = "src/videocuts/models/yolov8m-face_openvino_model/" # Converted OpenVINO dir
+    yolo_device: str = "cpu"          # Ignored when use_openvino is True, but kept for fallback
+    use_openvino: bool = False         # enable OpenVINO acceleration on Intel Arc
 
 
 @dataclass

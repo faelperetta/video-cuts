@@ -128,7 +128,11 @@ def analyze_clip_faces(
         elif detector_backend == "yolo" or cfg.face_tracking.use_yolo:
             # YOLO v8 (High Recall)
             from videocuts.video.detection import detect_faces_with_yolo
-            detections = detect_faces_with_yolo(cfg.face_tracking.yolo_model_path, frame)
+            detections = detect_faces_with_yolo(
+                cfg.face_tracking.yolo_model_path, 
+                frame,
+                device=cfg.face_tracking.yolo_device
+            )
             
             # STAGE 2: Landmark Extraction (MediaPipe) on Crop
             # Only run if we have a landmarker model loaded

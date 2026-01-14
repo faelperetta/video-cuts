@@ -132,7 +132,7 @@ def load_haar_cascade():
     
 _yolo_model = None
 
-def detect_faces_with_yolo(model_path: str, frame_bgr) -> List[Dict]:
+def detect_faces_with_yolo(model_path: str, frame_bgr, device: str = "cpu") -> List[Dict]:
     """
     Detect faces using YOLOv8-Face.
     Returns: List of dicts with {center, center_y, width, activity, box_int}
@@ -152,7 +152,7 @@ def detect_faces_with_yolo(model_path: str, frame_bgr) -> List[Dict]:
     
     # Run inference
     # conf=0.5 default, classes=0 (if standard yolo), but this is face specific so usually class 0 is face
-    results = _yolo_model(frame_bgr, verbose=False, conf=0.4, iou=0.5)
+    results = _yolo_model(frame_bgr, verbose=False, conf=0.4, iou=0.5, device=device)
     
     detections = []
     if not results:
