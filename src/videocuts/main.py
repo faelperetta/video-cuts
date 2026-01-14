@@ -6,8 +6,10 @@ from typing import List, Dict, Optional
 from videocuts.config import Config
 from videocuts.utils.system import cache_is_fresh
 from videocuts.utils.font import verify_font_available, print_font_installation_guide, get_font_path_with_fallback
-from videocuts.audio.transcription import transcribe_video, parse_srt_to_segments
-from videocuts.audio.analysis import extract_audio
+from videocuts.audio.transcription import transcribe_audio, parse_srt_to_segments
+from videocuts.audio.analysis import extract_audio_normalized
+from videocuts.models.transcript import Transcript
+import json
 from videocuts.llm.selector import detect_llm_availability, select_highlight_intervals_llm
 from videocuts.video.tracking import analyze_clip_faces, analyze_best_layout, determine_layout_segments, crop_x_expression_for_segments
 from videocuts.caption.generators import write_clip_ass
@@ -37,7 +39,9 @@ def run_pipeline(cfg: Config):
     """Run the full video processing pipeline with provided configuration."""
     input_video = cfg.paths.input_video
     srt_file = cfg.paths.srt_file
-    audio_wav = cfg.paths.audio_wav
+    audio_wav = cfg.paths.audio_16k_mono
+    audio_metadata_path = cfg.paths.audio_metadata
+    transcript_json_path = cfg.paths.transcript_json
     output_dir = cfg.paths.output_dir
     
     # 0. Setup Logging
@@ -54,19 +58,32 @@ def run_pipeline(cfg: Config):
         logger.warning(f"Caption font '{cfg.caption.font_name}' - NOT FOUND (fallback will be used)")
         print_font_installation_guide(cfg.caption.font_name)
     
-    # 2. Transcription
-    if not cfg.force_transcribe and cache_is_fresh(srt_file, video_mtime):
-        logger.info(f"Reusing cached transcription '{srt_file}'.")
-        segments = parse_srt_to_segments(srt_file)
-        detected_language = "unknown"
-    else:
-        segments, detected_language = transcribe_video(input_video, srt_file, model_size=cfg.model.whisper_size, language=cfg.model.whisper_language)
-    
-    # 3. Audio Extraction
+    # 2. Audio Extraction (before transcription for proper input format)
     if not cfg.force_audio_extraction and cache_is_fresh(audio_wav, video_mtime):
         logger.info(f"Reusing cached audio '{audio_wav}'.")
     else:
-        extract_audio(input_video, audio_wav)
+        metadata = extract_audio_normalized(input_video, audio_wav)
+        # Save metadata for reproducibility
+        with open(audio_metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"Audio metadata saved: {metadata}")
+    
+    # 3. Transcription (uses normalized audio, outputs JSON)
+    if not cfg.force_transcribe and cache_is_fresh(transcript_json_path, video_mtime):
+        logger.info(f"Reusing cached transcript '{transcript_json_path}'.")
+        transcript = Transcript.load(transcript_json_path)
+        segments = transcript.to_legacy_segments()
+        detected_language = transcript.language
+    else:
+        logger.info(f"Transcribing with provider='{cfg.transcription.provider}'...")
+        transcript = transcribe_audio(
+            audio_wav,
+            cfg.transcription,
+            output_json_path=transcript_json_path
+        )
+        segments = transcript.to_legacy_segments()
+        detected_language = transcript.language
+        logger.info(f"Detected language: '{detected_language}'")
         
     # 4. Highlight Selection
     if cfg.llm.enabled and detect_llm_availability():

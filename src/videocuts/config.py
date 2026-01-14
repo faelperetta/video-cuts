@@ -36,8 +36,8 @@ class FaceTrackingConfig:
     recenter_after: float = 1.5       # seconds without detection before easing to center
     min_face_width: float = 0.05      # minimum face width (normalized): relaxed for wide shots
     use_yolo: bool = True             # enable YOLO heavy detection
-    yolo_model_path: str = "src/videocuts/models/yolov8m-face_openvino_model/" # Converted OpenVINO dir
-    yolo_device: str = "cpu"          # Ignored when use_openvino is True, but kept for fallback
+    yolo_model_path: str = "src/videocuts/models/yolov8m-face.pt"  # Medium model .pt (avoids OpenVINO LLVM conflict)
+    yolo_device: str = "cpu"          # CPU inference (avoids LLVM conflict with transcription OpenVINO)
     use_openvino: bool = False         # enable OpenVINO acceleration on Intel Arc
 
 
@@ -148,6 +148,26 @@ class LLMConfig:
 
 
 @dataclass
+class TranscriptionConfig:
+    """Transcription provider configuration (Epic 2 - US-2.1)."""
+    # Provider selection: "local" or "openai"
+    provider: str = "local"
+    
+    # Local faster-whisper settings
+    model: str = "small"                    # Whisper model size (small for testing, large-v3 for production)
+    compute_type: str = "float16"           # float16, int8_float16, int8
+    device: str = "auto"                    # auto, openvino, cuda, cpu
+    vad_enabled: bool = True                # Voice Activity Detection
+    vad_filter_threshold: float = 0.5       # VAD sensitivity
+    
+    # OpenAI API settings (only used when provider="openai")
+    openai_model: str = "whisper-1"
+    
+    # Output settings
+    output_word_timestamps: bool = True
+
+
+@dataclass
 class PathConfig:
     """File paths and directories."""
     input_video: str = "input.webm"
@@ -162,8 +182,29 @@ class PathConfig:
         return os.path.join(self.project_root, "subs.srt")
 
     @property
+    def audio_16k_mono(self) -> str:
+        """Primary audio file for ASR/diarization (16kHz mono WAV)."""
+        return os.path.join(self.project_root, "audio_16k_mono.wav")
+    
+    @property
+    def audio_48k_stereo(self) -> str:
+        """High-quality audio for final render (48kHz stereo WAV)."""
+        return os.path.join(self.project_root, "audio_48k_stereo.wav")
+    
+    @property
+    def audio_metadata(self) -> str:
+        """Audio metadata JSON file."""
+        return os.path.join(self.project_root, "audio_metadata.json")
+    
+    @property
+    def transcript_json(self) -> str:
+        """JSON transcript with word-level timestamps."""
+        return os.path.join(self.project_root, "transcript.json")
+    
+    @property
     def audio_wav(self) -> str:
-        return os.path.join(self.project_root, "audio.mp3")
+        """DEPRECATED: Use audio_16k_mono instead."""
+        return self.audio_16k_mono
 
     @property
     def output_dir(self) -> str:
@@ -202,6 +243,7 @@ class Config:
     layout: LayoutConfig = field(default_factory=LayoutConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     content_type: str = "coding"      # "coding", "fitness", "gaming"
     force_transcribe: bool = False
     force_audio_extraction: bool = False
