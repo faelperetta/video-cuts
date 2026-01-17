@@ -1,8 +1,47 @@
 import os
 import math
-from typing import List, Dict
+from typing import List, Dict, Optional
 from videocuts.config import Config
 from videocuts.utils.system import format_timestamp
+
+from better_profanity import profanity
+
+def apply_profanity_filter(text: str, cfg: Config) -> str:
+    """Mask bad words with asterisks (e.g., 'f***') while keeping first letter."""
+    if not cfg.profanity.enabled:
+        return text
+    
+    # Initialize only once if needed (library handles this efficiently usually, but ensuring custom words)
+    # Note: better_profanity default load is fast.
+    if cfg.profanity.custom_words:
+        profanity.load_censor_words(cfg.profanity.custom_words)
+    else:
+        # Ensure default words are loaded if not already
+        # better-profanity loads default by default, but explicit load is safer if we want to reset
+        # However, for performance we might want to do this initialization outside this function.
+        # Given this is called per word/clip, let's rely on global state or assume lightweight check.
+        # For strict correctness with custom words, we should load once. 
+        # But here we act locally. To avoid reloading every time, we check if custom words are different.
+        # Simplified approach: Just load default if custom not present.
+        profanity.load_censor_words()
+
+    def censor_word(word: str) -> str:
+        # Strip punctuation for checking
+        clean_word = "".join(c for c in word if c.isalnum())
+        if not clean_word: return word
+        
+        if profanity.contains_profanity(clean_word):
+            # Keep first letter, mask the rest
+            if len(clean_word) > 1:
+                masked = clean_word[0] + "*" * (len(clean_word) - 1)
+                return word.replace(clean_word, masked)
+            else:
+                return "*"
+        return word
+
+    words = text.split()
+    return " ".join(censor_word(w) for w in words)
+
 
 def trim_text_to_clip(text: str, seg_start: float, seg_end: float, clip_end: float) -> str:
     """Heuristically drop unfinished sentences that extend beyond clip_end."""
@@ -30,7 +69,8 @@ def write_clip_srt(
     segments: List[Dict],
     clip_start: float,
     clip_end: float,
-    output_path: str
+    output_path: str,
+    cfg: Optional[Config] = None
 ) -> None:
     """Create a trimmed SRT where timestamps are relative to `clip_start`."""
     entries = []
@@ -52,6 +92,9 @@ def write_clip_srt(
 
         if not text:
             continue
+            
+        if cfg and cfg.profanity.enabled:
+            text = apply_profanity_filter(text, cfg)
 
         entries.append((counter, adj_start, adj_end, text))
         counter += 1
@@ -99,9 +142,16 @@ Style: Highlight,{font_name},{font_size},{high},{prim},{out},{back},1,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
-def extract_words_for_clip(segments: List[Dict], clip_start: float, clip_end: float) -> List[Dict]:
+def extract_words_for_clip(segments: List[Dict], clip_start: float, clip_end: float, cfg: Optional[Config] = None) -> List[Dict]:
     """Extract word-level timing data for a clip from Whisper segments."""
     words = []
+    
+    # Initialize profanity once per clip extraction if needed
+    if cfg and cfg.profanity.enabled and cfg.profanity.custom_words:
+        profanity.load_censor_words(cfg.profanity.custom_words)
+    elif cfg and cfg.profanity.enabled:
+        profanity.load_censor_words()
+        
     for seg in segments:
         seg_start, seg_end = seg.get("start", 0), seg.get("end", 0)
         if seg_end < clip_start or seg_start > clip_end:
@@ -114,6 +164,11 @@ def extract_words_for_clip(segments: List[Dict], clip_start: float, clip_end: fl
                 wt = word_info.get("word", "").strip()
                 if we < clip_start or ws > clip_end: continue
                 if wt:
+                    if cfg and cfg.profanity.enabled:
+                        # Check profanity on the cleaner version but preserve original punctuation if possible
+                        # Ideally apply_profanity_filter aims to preserve structure, let's use it on the single word.
+                        wt = apply_profanity_filter(wt, cfg)
+                        
                     words.append({"start": max(ws - clip_start, 0), "end": min(we - clip_start, clip_end - clip_start), "text": wt})
         else:
             text_words = seg["text"].strip().split()
@@ -123,7 +178,10 @@ def extract_words_for_clip(segments: List[Dict], clip_start: float, clip_end: fl
             if dur <= 0: continue
             w_dur = dur / len(text_words)
             for i, word in enumerate(text_words):
-                words.append({"start": cl_start + i * w_dur - clip_start, "end": cl_start + (i+1) * w_dur - clip_start, "text": word})
+                final_word = word
+                if cfg and cfg.profanity.enabled:
+                    final_word = apply_profanity_filter(word, cfg)
+                words.append({"start": cl_start + i * w_dur - clip_start, "end": cl_start + (i+1) * w_dur - clip_start, "text": final_word})
     return words
 
 def group_words_into_lines(words: List[Dict], words_per_line: int = 4) -> List[Dict]:
@@ -146,7 +204,7 @@ def write_clip_ass(
     cfg: Config
 ) -> None:
     """Create an ASS subtitle file with word-by-word highlighting animation."""
-    words = extract_words_for_clip(segments, clip_start, clip_end)
+    words = extract_words_for_clip(segments, clip_start, clip_end, cfg)
     if not words:
         with open(output_path, "w", encoding="utf-8") as f: f.write(generate_ass_header(cfg))
         return
