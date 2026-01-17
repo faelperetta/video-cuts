@@ -7,3 +7,4 @@ opencv-python
 yt-dlp
 openai>=1.0.0
 better-profanity
+python-dotenv
