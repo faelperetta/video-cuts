@@ -1,0 +1,16 @@
+# Docker Compose override for Intel Arc GPU support
+# 
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# This enables GPU passthrough for Intel Arc GPUs (A770, A750, A580, B580, etc.)
+# Requires:
+#   - Intel GPU drivers installed on host
+#   - /dev/dri device available
+#   - User in 'render' group on host
+
+services:
+  api:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - render

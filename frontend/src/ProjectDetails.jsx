@@ -10,8 +10,7 @@ import {
     X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-
-const API_BASE_URL = 'http://localhost:8000';
+import { API_BASE_URL } from './config';
 
 const VideoDialog = ({ clip, project, onClose }) => {
     if (!clip) return null;

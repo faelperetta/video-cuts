@@ -1,0 +1,55 @@
+# Git
+.git/
+.gitignore
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Large media files
+*.webm
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mkv
+*.ttf
+
+# Output directories
+clips_output/
+storage/
+JoeClips/
+clips_output_linus/
+test_input/
+joe/
+ceo/
+lifinho/
+
+# Frontend (built separately if needed)
+frontend/node_modules/
+frontend/dist/
+
+# Temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+
+# Documentation
+*.md
+!README.md
+epics/
+
+# Verification scripts
+verif_pyav_cut/
+verif_pyav_cut_v2/
