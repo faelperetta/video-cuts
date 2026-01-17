@@ -30,20 +30,24 @@ def setup_logging(debug: bool):
     level = logging.DEBUG if debug else logging.INFO
     formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
+    # App logger
+    app_logger = logging.getLogger("videocuts")
+    app_logger.setLevel(level)
+    app_logger.propagate = False
+    
+    # Clean up existing handlers to avoid duplication (for long-running processes)
+    if app_logger.hasHandlers():
+        app_logger.handlers.clear()
+        
     # Console handler
     ch = logging.StreamHandler()
     ch.setLevel(level)
     ch.setFormatter(formatter)
-    
-    # Root logger
-    root = logging.getLogger()
-    root.setLevel(logging.WARNING) # Suppress debug from other libs
-    
-    # App logger
-    app_logger = logging.getLogger("videocuts")
-    app_logger.setLevel(level)
     app_logger.addHandler(ch)
-    app_logger.propagate = False
+    
+    # Root logger (suppress others)
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)
 
 def run_pipeline(cfg: Config):
     """Run the full video processing pipeline with provided configuration."""
