@@ -203,11 +203,11 @@ class TimelineConfig:
 class CandidateConfig:
     """Candidate generation parameters (Epic 3 - US-3.1)."""
     min_len_s: float = 18.0
-    max_len_s: float = 55.0
+    max_len_s: float = 80
     target_len_s: float = 35.0
     step_s: float = 6.0
     snap_tolerance_s: float = 1.2
-    top_k_render: int = 5              # Number of clips to render
+    top_k_render: int = 10              # Number of clips to render
     max_overlap_ratio: float = 0.35    # Max overlap between selected clips
 
 

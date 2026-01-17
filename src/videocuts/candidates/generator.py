@@ -52,41 +52,56 @@ def generate_candidates(
     # Sliding window over timeline
     t = 0.0
     while t < duration - candidate_cfg.min_len_s:
-        # Propose window
-        proposed_start = t
-        proposed_end = t + candidate_cfg.target_len_s
+        # Generate candidates of varying lengths
+        # Start from min_len up to max_len with a step (e.g. 10s)
+        # We also include the specific target_len_s if standard
         
-        # Snap to segment boundaries
-        snapped_start = snap_to_segment_boundary(
-            proposed_start, 
-            timeline.segments,
-            candidate_cfg.snap_tolerance_s,
-            prefer="after"  # Prefer starting at segment start
-        )
-        snapped_end = snap_to_segment_boundary(
-            proposed_end,
-            timeline.segments,
-            candidate_cfg.snap_tolerance_s,
-            prefer="before"  # Prefer ending at segment end
-        )
+        scan_step = 10.0 # Scan every 10s of duration
+        lengths_to_scan = sorted(list(set(
+            [candidate_cfg.target_len_s] + 
+            list(range(int(candidate_cfg.min_len_s), int(candidate_cfg.max_len_s) + 1, int(scan_step))) +
+            [candidate_cfg.max_len_s]
+        )))
         
-        # Calculate duration after snapping
-        candidate_duration = snapped_end - snapped_start
-        
-        # Validate duration constraints
-        if validate_candidate(
-            snapped_start, 
-            snapped_end,
-            candidate_cfg.min_len_s,
-            candidate_cfg.max_len_s
-        ):
-            candidate_id += 1
-            candidates.append(CandidateWindow(
-                candidate_id=f"c_{candidate_id:04d}",
-                start_s=round(snapped_start, 3),
-                end_s=round(snapped_end, 3),
-                duration_s=round(candidate_duration, 3)
-            ))
+        for length in lengths_to_scan:
+            if length < candidate_cfg.min_len_s or length > candidate_cfg.max_len_s:
+                continue
+                
+            # Propose window
+            proposed_start = t
+            proposed_end = t + length
+            
+            # Snap to segment boundaries
+            snapped_start = snap_to_segment_boundary(
+                proposed_start, 
+                timeline.segments,
+                candidate_cfg.snap_tolerance_s,
+                prefer="after"  # Prefer starting at segment start
+            )
+            snapped_end = snap_to_segment_boundary(
+                proposed_end,
+                timeline.segments,
+                candidate_cfg.snap_tolerance_s,
+                prefer="before"  # Prefer ending at segment end
+            )
+            
+            # Calculate duration after snapping
+            candidate_duration = snapped_end - snapped_start
+            
+            # Validate duration constraints
+            if validate_candidate(
+                snapped_start, 
+                snapped_end,
+                candidate_cfg.min_len_s,
+                candidate_cfg.max_len_s
+            ):
+                candidate_id += 1
+                candidates.append(CandidateWindow(
+                    candidate_id=f"c_{candidate_id:04d}",
+                    start_s=round(snapped_start, 3),
+                    end_s=round(snapped_end, 3),
+                    duration_s=round(candidate_duration, 3)
+                ))
         
         t += candidate_cfg.step_s
     
