@@ -107,6 +107,13 @@ class HookConfig:
 
 
 @dataclass
+class ProfanityConfig:
+    """Profanity filtering configuration."""
+    enabled: bool = True
+    custom_words: List[str] = field(default_factory=list)
+
+
+@dataclass
 class LayoutConfig:
     """Multi-speaker layout configuration."""
     mode: str = "auto"                # "auto", "single", "split", "wide"
@@ -250,6 +257,7 @@ class Config:
     fast_mode: bool = False           # --fast flag for faster dev iterations
     debug: bool = False               # --debug flag for verbose logging
     cpu_limit: int = 0                # 0 = unlimited, >0 = max threads
+    profanity: ProfanityConfig = field(default_factory=ProfanityConfig)
     
     def enable_fast_mode(self) -> None:
         """Enable fast mode for quicker development iterations."""
