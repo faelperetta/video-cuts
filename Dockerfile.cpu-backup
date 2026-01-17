@@ -1,0 +1,105 @@
+# =============================================================================
+# VideoCuts Docker Image - CPU Optimized
+# =============================================================================
+# Uses CPU-only PyTorch for maximum compatibility
+# For Intel Arc GPU support, run on host or use docker-compose.gpu.yml
+# =============================================================================
+
+FROM python:3.11-slim
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# -----------------------------------------------------------------------------
+# Install system dependencies for OpenCV, MediaPipe, and video processing
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # OpenCV dependencies
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    # Video processing
+    ffmpeg \
+    # Build tools (for some pip packages)
+    build-essential \
+    # Clean up
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Setup working directory
+# -----------------------------------------------------------------------------
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+# Install Python dependencies
+# -----------------------------------------------------------------------------
+# Copy only dependency files first for better layer caching
+COPY pyproject.toml ./
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
+
+# Install CPU-only PyTorch first (smaller, no CUDA)
+RUN pip install --no-cache-dir \
+    torch \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies
+RUN pip install --no-cache-dir \
+    # Core dependencies
+    fastapi \
+    "uvicorn[standard]" \
+    "sqlalchemy[asyncio]" \
+    asyncpg \
+    pydantic-settings \
+    python-dotenv \
+    # Video/Audio processing
+    opencv-python-headless \
+    mediapipe \
+    pillow \
+    # AI/ML (whisper, etc.)
+    openai-whisper \
+    faster-whisper \
+    openai \
+    transformers \
+    numpy \
+    # Video download
+    yt-dlp \
+    # Text processing
+    better-profanity \
+    # HTTP
+    requests \
+    httpx
+
+# -----------------------------------------------------------------------------
+# Copy application source code
+# -----------------------------------------------------------------------------
+COPY src/ ./src/
+
+# Install the package itself
+RUN pip install --no-cache-dir -e .
+
+# -----------------------------------------------------------------------------
+# Configure runtime environment
+# -----------------------------------------------------------------------------
+# Create storage directory
+RUN mkdir -p /app/storage
+
+# Environment defaults
+ENV STORAGE_PATH=/app/storage
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+# Disable Intel extension auto-loading (fallback to CPU)
+ENV TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
+# Expose API port
+EXPOSE 8000
+
+# -----------------------------------------------------------------------------
+# Default command: Run FastAPI server
+# -----------------------------------------------------------------------------
+CMD ["uvicorn", "videocuts.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

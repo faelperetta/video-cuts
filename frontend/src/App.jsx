@@ -14,8 +14,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import './App.css';
 import ProjectDetails from './ProjectDetails';
-
-const API_BASE_URL = 'http://localhost:8000';
+import { API_BASE_URL } from './config';
 
 const FeatureIcon = ({ icon: Icon, label }) => (
   <div className="feature-item">

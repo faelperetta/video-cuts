@@ -1,4 +1,36 @@
 services:
+  # ===========================================================================
+  # VideoCuts API - Python FastAPI application with Intel Arc XPU support
+  # ===========================================================================
+  api:
+    build: .
+    container_name: videocuts_api
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://videocuts:videocuts_dev@db:5432/videocuts
+      - STORAGE_PATH=/app/storage
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+    # Intel Arc GPU passthrough (uncomment if you have Intel Arc GPU)
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - render  # Required for GPU access
+    deploy:
+      resources:
+        limits:
+          cpus: "8"      # Max 8 CPU cores
+          memory: 16G    # Memory limit for video processing
+
+  # ===========================================================================
+  # PostgreSQL Database
+  # ===========================================================================
   db:
     image: postgres:17
     container_name: videocuts_db
@@ -11,6 +43,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U videocuts"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:

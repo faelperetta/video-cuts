@@ -153,10 +153,12 @@ class LLMConfig:
     """External LLM configuration for clip identification."""
     provider: str = "openai"              # "openai"
     model: str = "gpt-4o-mini"             # Model to use
-    enabled: bool = False                  # Auto-enabled if API key is set
+    enabled: bool = True                   # Enabled by default (Epic 3)
     prompt_template_path: str = "prompt.md"  # Path to the prompt template
     max_tokens: int = 4000
     temperature: float = 0.7
+    rerank_top_n: int = 12                 # Only rerank top N candidates (Epic 3)
+    rerank_temperature: float = 0.2        # Lower for consistency in reranking
 
 
 @dataclass
@@ -177,6 +179,36 @@ class TranscriptionConfig:
     
     # Output settings
     output_word_timestamps: bool = True
+
+
+@dataclass
+class DiarizationConfig:
+    """Speaker diarization configuration (Epic 3 - US-3.0)."""
+    enabled: bool = True
+    model: str = "pyannote/speaker-diarization-3.1"
+    min_speakers: int = 1
+    max_speakers: int = 4
+    device: str = "auto"  # auto, cuda, cpu
+
+
+@dataclass
+class TimelineConfig:
+    """Timeline building configuration (Epic 3 - US-3.0)."""
+    rms_window_s: float = 0.5
+    rms_hop_s: float = 0.1
+    silence_threshold_db: float = -40.0
+
+
+@dataclass
+class CandidateConfig:
+    """Candidate generation parameters (Epic 3 - US-3.1)."""
+    min_len_s: float = 18.0
+    max_len_s: float = 55.0
+    target_len_s: float = 35.0
+    step_s: float = 6.0
+    snap_tolerance_s: float = 1.2
+    top_k_render: int = 5              # Number of clips to render
+    max_overlap_ratio: float = 0.35    # Max overlap between selected clips
 
 
 @dataclass
@@ -238,6 +270,52 @@ class PathConfig:
     def openvino_face_model(self) -> str:
         # Default exported path from ultralytics
         return "src/videocuts/models/yolov8n-face_openvino_model/yolov8n-face.xml"
+    
+    # Epic 3 artifact paths
+    @property
+    def diarization_json(self) -> str:
+        """Speaker diarization output."""
+        return os.path.join(self.project_root, "diarization.json")
+    
+    @property
+    def timeline_json(self) -> str:
+        """Enriched timeline with audio features."""
+        return os.path.join(self.project_root, "timeline.json")
+    
+    @property
+    def audio_features_json(self) -> str:
+        """Audio feature analysis."""
+        return os.path.join(self.project_root, "audio_features.json")
+    
+    @property
+    def candidates_raw_json(self) -> str:
+        """Raw candidate windows."""
+        return os.path.join(self.project_root, "candidates_raw.json")
+    
+    @property
+    def candidates_features_json(self) -> str:
+        """Candidates with computed features."""
+        return os.path.join(self.project_root, "candidates_features.json")
+    
+    @property
+    def candidates_scored_json(self) -> str:
+        """Scored and filtered candidates."""
+        return os.path.join(self.project_root, "candidates_scored.json")
+    
+    @property
+    def candidates_llm_json(self) -> str:
+        """LLM-reranked candidates (optional)."""
+        return os.path.join(self.project_root, "candidates_llm.json")
+    
+    @property
+    def clips_selected_json(self) -> str:
+        """Final selected clips before refinement."""
+        return os.path.join(self.project_root, "clips_selected.json")
+    
+    @property
+    def clips_refined_json(self) -> str:
+        """Refined clips ready for rendering."""
+        return os.path.join(self.project_root, "clips_refined.json")
 
 
 @dataclass
@@ -263,6 +341,9 @@ class Config:
     debug: bool = False               # --debug flag for verbose logging
     cpu_limit: int = 0                # 0 = unlimited, >0 = max threads
     profanity: ProfanityConfig = field(default_factory=ProfanityConfig)
+    diarization: DiarizationConfig = field(default_factory=DiarizationConfig)  # Epic 3
+    timeline: TimelineConfig = field(default_factory=TimelineConfig)            # Epic 3
+    candidate: CandidateConfig = field(default_factory=CandidateConfig)         # Epic 3
     
     def enable_fast_mode(self) -> None:
         """Enable fast mode for quicker development iterations."""
