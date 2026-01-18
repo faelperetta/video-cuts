@@ -40,10 +40,10 @@ class FaceTrackingConfig:
     activity_threshold: float = 0.0035  # threshold for choosing active speaker
     recenter_after: float = 1.5       # seconds without detection before easing to center
     min_face_width: float = 0.05      # minimum face width (normalized): relaxed for wide shots
-    use_yolo: bool = True             # enable YOLO heavy detection
-    yolo_model_path: str = "src/videocuts/models/yolov8m-face.pt"  # Medium model .pt (avoids OpenVINO LLVM conflict)
-    yolo_device: str = "cpu"          # CPU inference (avoids LLVM conflict with transcription OpenVINO)
-    use_openvino: bool = False         # enable OpenVINO acceleration on Intel Arc
+    use_yolo: bool = True              # Enable YOLO (PyTorch backend)
+    yolo_model_path: str = "src/videocuts/models/yolov8m-face.pt"
+    yolo_device: str = "cpu"           # CPU avoids SPIR-V (XPU) and LLVM legacy (OpenVINO) issues
+    use_openvino: bool = False         # Disable OpenVINO to prevent LLVM 'simd-mode' conflict
 
 
 @dataclass
@@ -164,8 +164,11 @@ class LLMConfig:
 @dataclass
 class TranscriptionConfig:
     """Transcription provider configuration (Epic 2 - US-2.1)."""
-    # Provider selection: "local" or "openai"
-    provider: str = "local"
+    # Provider selection: "local", "openai", or "isolated"
+    provider: str = "isolated"
+    
+    # Process Isolation settings
+    isolated_worker_timeout_s: int = 1200   # Timeout for isolated transcription process
     
     # Local faster-whisper settings
     model: str = "small"                    # Whisper model size (small for testing, large-v3 for production)
@@ -268,8 +271,8 @@ class PathConfig:
 
     @property
     def openvino_face_model(self) -> str:
-        # Default exported path from ultralytics
-        return "src/videocuts/models/yolov8n-face_openvino_model/yolov8n-face.xml"
+        # Exported Medium model path
+        return "src/videocuts/models/yolov8m-face_openvino_model/yolov8m-face.xml"
     
     # Epic 3 artifact paths
     @property

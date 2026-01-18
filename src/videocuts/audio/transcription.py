@@ -211,6 +211,67 @@ class OpenAIProvider(TranscriptionProvider):
 
 
 # =============================================================================
+# Process Isolated Provider
+# =============================================================================
+
+def _isolated_worker(
+    cfg: TranscriptionConfig,
+    audio_path: str,
+    result_queue: "multiprocessing.Queue"
+):
+    """Worker function to run transcription in a separate process."""
+    try:
+        # Re-initialize logging in the new process
+        logging.basicConfig(level=logging.INFO)
+        # Create a local provider instance within this isolated process
+        # This is where faster-whisper/OpenVINO gets loaded safely
+        provider = LocalFasterWhisperProvider(cfg)
+        transcript = provider.transcribe(audio_path)
+        result_queue.put(("success", transcript))
+    except Exception as e:
+        logger.exception("Error in isolated transcription worker")
+        result_queue.put(("error", str(e)))
+
+class ProcessIsolatedWhisperProvider(TranscriptionProvider):
+    """
+    Runs transcription in a separate process to avoid LLVM/OpenMP conflicts.
+    Useful when mixing OpenVINO (faster-whisper) and PyTorch XPU (YOLO).
+    """
+    
+    def __init__(self, cfg: TranscriptionConfig):
+        self.cfg = cfg
+
+    def transcribe(self, audio_path: str) -> Transcript:
+        import multiprocessing
+        
+        logger.info(f"Starting isolated transcription for '{audio_path}'")
+        
+        ctx = multiprocessing.get_context('spawn') # Use spawn to ensure clean slate
+        queue = ctx.Queue()
+        
+        p = ctx.Process(
+            target=_isolated_worker,
+            args=(self.cfg, audio_path, queue)
+        )
+        
+        p.start()
+        
+        # Wait for result with timeout
+        try:
+            status, result = queue.get(timeout=self.cfg.isolated_worker_timeout_s)
+        except Exception as e: # Queue.Empty or other errors
+            p.kill()
+            raise RuntimeError(f"Isolated transcription timed out or failed: {e}")
+            
+        p.join()
+        
+        if status == "error":
+            raise RuntimeError(f"Isolated transcription failed: {result}")
+            
+        return result
+
+
+# =============================================================================
 # Provider Factory
 # =============================================================================
 
@@ -223,6 +284,9 @@ def get_transcription_provider(cfg: TranscriptionConfig) -> TranscriptionProvide
             logger.warning("OPENAI_API_KEY not set, falling back to local provider")
             return LocalFasterWhisperProvider(cfg)
         return OpenAIProvider(cfg)
+
+    if cfg.provider == "isolated":
+        return ProcessIsolatedWhisperProvider(cfg)
     
     return LocalFasterWhisperProvider(cfg)
 
