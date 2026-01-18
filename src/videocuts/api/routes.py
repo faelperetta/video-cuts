@@ -386,3 +386,38 @@ async def get_clip_thumbnail(
         raise HTTPException(status_code=404, detail="Thumbnail not found")
         
     return FileResponse(thumb_path)
+
+
+@router.delete("/{project_id}", status_code=204)
+async def delete_project(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a project and all associated files."""
+    import shutil
+    
+    # Get project
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Retrieve work_dir before deleting the project record
+    work_dir = project.work_dir
+    
+    # Delete project (cascades to clips)
+    await db.delete(project)
+    await db.commit()
+    
+    # Delete storage files
+    if work_dir and os.path.exists(work_dir):
+        try:
+            shutil.rmtree(work_dir)
+            logger.info(f"Deleted project directory: {work_dir}")
+        except Exception as e:
+            logger.error(f"Failed to delete project directory {work_dir}: {e}")
+            # We don't raise an error here to ensure the API call succeeds even if file deletion fails partially
+            
+    logger.info(f"Project {project_id} deleted")
+    return None

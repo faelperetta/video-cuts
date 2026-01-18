@@ -1,13 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import {
     ChevronLeft,
     Play,
     RotateCcw,
-    Clock,
     TrendingUp,
-    X
+    X,
+    Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { API_BASE_URL } from './config';
@@ -107,6 +107,7 @@ const ClipCard = ({ clip, project, onClick }) => (
 
 const ProjectDetails = () => {
     const { id } = useParams();
+    const navigate = useNavigate();
     const [project, setProject] = useState(null);
     const [selectedClip, setSelectedClip] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -145,6 +146,20 @@ const ProjectDetails = () => {
         }
     };
 
+    const handleDelete = async () => {
+        if (!window.confirm('Are you sure you want to delete this project? This action cannot be undone.')) {
+            return;
+        }
+
+        try {
+            await axios.delete(`${API_BASE_URL}/v1/projects/${id}`);
+            navigate('/');
+        } catch (err) {
+            console.error('Failed to delete project:', err);
+            alert('Failed to delete project');
+        }
+    };
+
     if (loading) return <div className="app-container"><p>Loading project...</p></div>;
     if (!project) return <div className="app-container"><p>Project not found.</p></div>;
 
@@ -163,14 +178,23 @@ const ProjectDetails = () => {
                                 {project.original_url}
                             </p>
                         </div>
-                        <button
-                            className="rerun-button"
-                            onClick={handleRerun}
-                            disabled={rerunning || ['pending', 'downloading', 'processing'].includes(project.status.toLowerCase())}
-                        >
-                            <RotateCcw size={14} className={rerunning ? 'spin' : ''} />
-                            {rerunning ? 'Rerunning...' : 'Rerun Project'}
-                        </button>
+                        <div style={{ display: 'flex', gap: '10px' }}>
+                            <button
+                                className="rerun-button"
+                                onClick={handleRerun}
+                                disabled={rerunning || ['pending', 'downloading', 'processing'].includes(project.status.toLowerCase())}
+                            >
+                                <RotateCcw size={14} className={rerunning ? 'spin' : ''} />
+                                {rerunning ? 'Rerunning...' : 'Rerun Project'}
+                            </button>
+                            <button
+                                className="delete-action-button"
+                                onClick={handleDelete}
+                            >
+                                <Trash2 size={14} />
+                                Delete
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -219,7 +243,7 @@ const ProjectDetails = () => {
                     />
                 )}
             </AnimatePresence>
-        </div>
+        </div >
     );
 };
 
