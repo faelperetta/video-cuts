@@ -9,7 +9,8 @@ import {
   Mic2,
   RefreshCcw,
   Layout,
-  Clock
+  Clock,
+  Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import './App.css';
@@ -35,7 +36,7 @@ const getYoutubeThumbnail = (url) => {
   return null;
 };
 
-const ProjectCard = ({ project }) => {
+const ProjectCard = ({ project, onDelete }) => {
   const navigate = useNavigate();
   const isProcessing = ['pending', 'downloading', 'processing'].includes(project.status.toLowerCase());
   const thumbnail = getYoutubeThumbnail(project.original_url);
@@ -62,7 +63,19 @@ const ProjectCard = ({ project }) => {
           {project.status}
         </span>
       </div>
-      <div className="card-info">
+      <div className="card-info" style={{ position: 'relative' }}>
+        <button
+          className="delete-button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (window.confirm('Are you sure you want to delete this project? This action cannot be undone.')) {
+              onDelete(project.id);
+            }
+          }}
+          title="Delete Project"
+        >
+          <Trash2 size={16} />
+        </button>
         <h3 className="card-title">{project.original_title || project.name || 'Untitled Video'}</h3>
         <p style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
           {new Date(project.created_at).toLocaleDateString()}
@@ -101,6 +114,17 @@ const ProjectList = () => {
       setProjects(response.data);
     } catch (err) {
       console.error('Failed to fetch projects:', err);
+    }
+  };
+
+  const handleDeleteProject = async (projectId) => {
+    try {
+      await axios.delete(`${API_BASE_URL}/v1/projects/${projectId}`);
+      // Optimistic update or refresh
+      setProjects(projects.filter(p => p.id !== projectId));
+    } catch (err) {
+      console.error('Failed to delete project:', err);
+      setError('Failed to delete project.');
     }
   };
 
@@ -191,7 +215,7 @@ const ProjectList = () => {
         <AnimatePresence mode="popLayout">
           <div className="projects-grid">
             {projects.map((project) => (
-              <ProjectCard key={project.id} project={project} />
+              <ProjectCard key={project.id} project={project} onDelete={handleDeleteProject} />
             ))}
           </div>
         </AnimatePresence>

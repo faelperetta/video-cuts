@@ -197,6 +197,42 @@
   backdrop-filter: blur(4px);
 }
 
+.delete-button {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 0.5rem;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* background: transparent; */
+  /* Remove blur for text area if preferred, or keep it */
+  background: rgba(0, 0, 0, 0.1);
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  z-index: 2;
+  opacity: 0;
+}
+
+.delete-button:hover {
+  background: #ef4444;
+  color: white;
+  opacity: 1 !important;
+}
+
+.project-card:hover .delete-button {
+  opacity: 1;
+}
+
+.delete-button:hover {
+  background: #ef4444;
+  /* red-500 */
+}
+
 .status-completed {
   color: #4ade80;
 }
@@ -367,9 +403,30 @@
   border: 1px solid var(--border-color);
   border-radius: var(--button-radius);
   font-size: var(--font-size-sm);
+  transition: all 0.2s ease;
 }
 
 .rerun-button:hover {
   border-color: var(--text-secondary);
   background: var(--bg-secondary);
+}
+
+.delete-action-button {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 1rem;
+  background: rgba(0, 0, 0, 0.2);
+  color: #ef4444;
+  /* Red text */
+  border: 1px solid #ef4444;
+  /* Red border */
+  border-radius: var(--button-radius);
+  font-size: var(--font-size-sm);
+  transition: all 0.2s ease;
+}
+
+.delete-action-button:hover {
+  background: #ef4444;
+  color: #fff;
 }
