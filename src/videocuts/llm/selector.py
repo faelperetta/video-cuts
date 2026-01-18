@@ -4,9 +4,24 @@ import re
 import logging
 from typing import List, Dict, Tuple, Optional
 from videocuts.config import Config
-from videocuts.highlights.selector import extend_interval_to_last_word
+from videocuts.config import Config
 
 logger = logging.getLogger(__name__)
+
+def extend_interval_to_last_word(
+    segments: List[Dict],
+    clip_start: float,
+    clip_end: float,
+    pad: float,
+    video_duration: float
+) -> float:
+    best_end = clip_end
+    for seg in segments:
+        if seg["start"] < clip_end and seg["end"] > clip_end:
+            best_end = min(seg["end"] + pad, video_duration)
+            break
+    return best_end
+
 
 CLIPS_SCHEMA = {
     "type": "object",
