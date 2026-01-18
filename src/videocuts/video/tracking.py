@@ -104,7 +104,11 @@ def analyze_clip_faces(
         # STAGE 1: Face Detection
         if detector_backend == "openvino":
             # OpenVINO (Highest performance on Intel Arc)
-            detections = detect_faces_with_openvino(cfg.paths.openvino_face_model, frame)
+            detections = detect_faces_with_openvino(
+                cfg.paths.openvino_face_model, 
+                frame,
+                device=cfg.face_tracking.openvino_device
+            )
             
             # STAGE 2: Landmark Extraction on Crop (MediaPipe)
             if face_landmarker is not None and detections:
