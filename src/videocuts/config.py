@@ -165,7 +165,7 @@ class LLMConfig:
 class TranscriptionConfig:
     """Transcription provider configuration (Epic 2 - US-2.1)."""
     # Provider selection: "local", "openai", or "isolated"
-    provider: str = "isolated"
+    provider: str = "local"
     
     # Process Isolation settings
     isolated_worker_timeout_s: int = 1200   # Timeout for isolated transcription process
@@ -210,7 +210,7 @@ class CandidateConfig:
     target_len_s: float = 35.0
     step_s: float = 6.0
     snap_tolerance_s: float = 1.2
-    top_k_render: int = 1              # Number of clips to render
+    top_k_render: int = 15              # Number of clips to render
     max_overlap_ratio: float = 0.35    # Max overlap between selected clips
 
 

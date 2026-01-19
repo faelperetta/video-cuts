@@ -5,7 +5,6 @@ services:
   api:
     build: .
     container_name: videocuts_api
-    restart: unless-stopped
     environment:
       - DATABASE_URL=postgresql+asyncpg://videocuts:videocuts_dev@db:5432/videocuts
       - STORAGE_PATH=/app/storage

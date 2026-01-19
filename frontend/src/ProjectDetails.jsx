@@ -7,7 +7,8 @@ import {
     RotateCcw,
     TrendingUp,
     X,
-    Trash2
+    Trash2,
+    Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { API_BASE_URL } from './config';
