@@ -256,14 +256,36 @@ class ProcessIsolatedWhisperProvider(TranscriptionProvider):
         
         p.start()
         
-        # Wait for result with timeout
-        try:
-            status, result = queue.get(timeout=self.cfg.isolated_worker_timeout_s)
-        except Exception as e: # Queue.Empty or other errors
-            p.kill()
-            raise RuntimeError(f"Isolated transcription timed out or failed: {e}")
+        # Wait for result with monitoring
+        import time
+        import queue as pyqueue
+        
+        start_time = time.time()
+        result_payload = None
+        
+        while time.time() - start_time < self.cfg.isolated_worker_timeout_s:
+            if not p.is_alive():
+                # Process died check if we have data
+                try:
+                    result_payload = queue.get_nowait()
+                    break
+                except pyqueue.Empty:
+                    exit_code = p.exitcode
+                    raise RuntimeError(f"Isolated transcription process died unexpectedly (exit code: {exit_code}). See logs for details.")
             
+            try:
+                # Poll queue
+                result_payload = queue.get(timeout=0.5)
+                break
+            except pyqueue.Empty:
+                continue
+                
+        if result_payload is None:
+            p.kill()
+            raise RuntimeError(f"Isolated transcription timed out after {self.cfg.isolated_worker_timeout_s}s")
+
         p.join()
+        status, result = result_payload
         
         if status == "error":
             raise RuntimeError(f"Isolated transcription failed: {result}")
@@ -285,8 +307,9 @@ def get_transcription_provider(cfg: TranscriptionConfig) -> TranscriptionProvide
             return LocalFasterWhisperProvider(cfg)
         return OpenAIProvider(cfg)
 
-    if cfg.provider == "isolated":
-        return ProcessIsolatedWhisperProvider(cfg)
+    # Process Isolation removed per user request
+    # if cfg.provider == "isolated":
+    #     return ProcessIsolatedWhisperProvider(cfg)
     
     return LocalFasterWhisperProvider(cfg)
 

@@ -7,9 +7,9 @@ name = "videocuts"
 version = "0.1.0"
 description = "A modular video highlight generator using AI"
 dependencies = [
-    "torch",
-    "torchaudio",
-    "openai-whisper",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchvision==0.23.0",
     "transformers",
     "numpy",
     "opencv-python",
@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv",
     "pydantic-settings",
     "faster-whisper",
+    "pyannote-audio",
 ]
 
 [project.scripts]
